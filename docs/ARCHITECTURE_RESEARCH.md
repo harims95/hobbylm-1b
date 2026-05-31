@@ -194,4 +194,26 @@ paper estimate, since real DDP throughput beat the conservative efficiency assum
 `modal run modal_train.py --action train --preset 1B --gpus 8 --steps 95400 --opts fused_ce --micro 32
 --batch-tokens 1048576 --data 100B --run-name 1B_100B --save-every 5000`.
 
+## 9. Downstream eval — lm-evaluation-harness (0-shot) — 2026-05-31
+EleutherAI lm-eval-harness (v0.4.9.1) via a custom `MoELMWrapper` (eval_harness.py; loglikelihood over
+our MoE + gpt2 tokenizer). `modal run modal_train.py --action lmeval --run-name both`. acc_norm where
+defined, else acc. (Active params: 130M→62M, 500M→169M; both near GPT-2-small/Pythia-160M class.)
+
+| task | 130M_10B | 500M_40B | random |
+|---|---|---|---|
+| lambada_openai (acc) | 0.2996 | **0.3998** | 0 |
+| hellaswag | 0.3253 | **0.4154** | 0.25 |
+| arc_easy | 0.3771 | **0.4272** | 0.25 |
+| arc_challenge | 0.2355 | 0.2235 | 0.25 |
+| piqa | 0.6545 | **0.6964** | 0.50 |
+| winogrande (acc) | 0.5264 | 0.5162 | 0.50 |
+| openbookqa | 0.2820 | **0.2960** | 0.25 |
+| sciq | 0.6020 | **0.7030** | 0.25 |
+| boolq (acc) | 0.6125 | 0.5104 | ~0.62 (majority) |
+| **average** | **0.4350** | **0.4653** | — |
+
+500M wins on every LM-driven task (lambada/hellaswag/sciq/piqa/arc_easy, +0.05–0.10), consistent with its
+lower val loss (3.03 vs 3.30). arc_challenge/winogrande sit at chance for both (expected at this scale); boolq
+hovers near the majority-class baseline (noisy for base models). Results saved to `runs/<name>/lm_eval.json`.
+
 See [[moe-project]], [[modal-infra]].
