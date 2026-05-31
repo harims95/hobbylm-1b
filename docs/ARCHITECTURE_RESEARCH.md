@@ -187,4 +187,11 @@ over much longer runs per the paper). **FP8 head dropped:** no speedup, +51M par
 backward bug that prevents training. The always-on opts (no-sync accumulation, `expandable_segments`, prefetch)
 are pure wins. For the 1B run: enable `fused_ce` and raise `micro_batch_seqs` to exploit the freed memory.
 
+**MEASURED — 1B end-to-end training time (8×H100 DDP, 60-step probe, fused_ce, micro=32, 1.05M-tok batch):**
+**~1.53 s/step** steady-state (~688k tok/s aggregate, ~86k/GPU; micro=32 fits in DDP, no OOM). At 1.05M
+tokens/step, **100B tokens = 95,400 steps ≈ 41–42 h wall-clock (~$1,300 on Modal H100)** — ~10–20 h under the
+paper estimate, since real DDP throughput beat the conservative efficiency assumption. Launch command:
+`modal run modal_train.py --action train --preset 1B --gpus 8 --steps 95400 --opts fused_ce --micro 32
+--batch-tokens 1048576 --data 100B --run-name 1B_100B --save-every 5000`.
+
 See [[moe-project]], [[modal-infra]].
