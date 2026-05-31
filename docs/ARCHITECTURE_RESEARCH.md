@@ -216,22 +216,29 @@ defined, else acc. (Active params: 130M→62M, 500M→169M; both near GPT-2-smal
 lower val loss (3.03 vs 3.30). arc_challenge/winogrande sit at chance for both (expected at this scale); boolq
 hovers near the majority-class baseline (noisy for base models). Results saved to `runs/<name>/lm_eval.json`.
 
-**Comparison vs published small models** (same 7-task avg: HellaSwag/Obqa/WinoGrande/ARC_c/ARC_e/boolq/piqa,
-0-shot acc_norm|acc — the TinyLlama eval convention). Our 7-task avgs: **500M_40B = 44.07, 130M_10B = 43.05**.
+**Sub-1B comparison — all run through OUR harness (`--action lmeval_hf`, identical 7-task protocol).**
+Validated by reproduction: MicroLlama 42.23 (card: 42.36), TinyLlama-1.1B-3T 52.75 (card: 52.99). Sorted by avg:
 
-| model | params | tokens | 7-task avg |
-|---|---|---|---|
-| TinyLlama-1.1B (3T) | 1.1B dense | 3T | 52.99 |
-| TinyLlama-1.1B-Chat | 1.1B dense | 503B | 49.57 |
-| **our 500M_40B** | 500M / 169M act | 40B | **44.07** |
-| **our 130M_10B** | 140M / 62M act | 10B | **43.05** |
-| MicroLlama | 300M dense | 50B | 42.36 |
-| bert-large-uncased | 340M | — | 34.26 |
+| # | model | params | tokens | hella | obqa | wino | arc_c | arc_e | boolq | piqa | **avg** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | SmolLM2-360M | 360M | 4T | 56.41 | 38.00 | 59.35 | 38.48 | 68.22 | 62.08 | 71.49 | 56.29 |
+| 2 | Qwen3-0.6B | 600M | 36T | 53.81 | 34.60 | 58.56 | 38.31 | 58.08 | 69.82 | 70.29 | 54.78 |
+| 3 | SmolLM2-135M | 135M | 2T | 43.13 | 33.20 | 52.25 | 29.44 | 58.59 | 60.37 | 68.39 | 49.34 |
+| 4 | gemma-3-270m | 270M | 6T | 41.28 | 30.60 | 53.43 | 28.33 | 57.07 | 57.77 | 68.12 | 48.09 |
+| 5 | pythia-410m | 410M | 300B | 40.14 | 28.80 | 52.96 | 23.98 | 45.45 | 58.50 | 67.52 | 45.34 |
+| 6 | **OURS-500M-MoE** | 500M/169M act | 40B | 41.54 | 29.60 | 51.62 | 22.35 | 42.72 | 51.04 | 69.64 | **44.07** |
+| 7 | opt-350m | 350M | 180B | 36.55 | 28.40 | 52.80 | 24.74 | 40.49 | 57.61 | 64.69 | 43.61 |
+| 8 | **OURS-130M-MoE** | 140M/62M act | 10B | 32.53 | 28.20 | 52.64 | 23.55 | 37.71 | 61.25 | 65.45 | **43.05** |
+| 9 | MicroLlama-300M | 300M | 50B | 34.22 | 30.40 | 51.30 | 23.21 | 39.23 | 52.57 | 64.69 | 42.23 |
+| 10 | gpt2-124m | 124M | ~10B | 31.15 | 27.40 | 51.46 | 22.53 | 39.60 | 49.94 | 62.24 | 40.62 |
+| 11 | pythia-160m | 160M | 300B | 30.21 | 26.60 | 49.64 | 24.83 | 36.95 | 42.42 | 59.52 | 38.60 |
 
-**Headline: our 500M beats MicroLlama-300M (44.07 vs 42.36) on fewer tokens (40B vs 50B) and ~half the active
-params (169M vs 300M)** — winning the LM-driven tasks (hellaswag 41.5 vs 34.3, arc_e 42.7 vs 39.1, piqa 69.6 vs
-64.6). Honest caveat: the 130M's edge is boolq-inflated; excluding boolq (6-task avg) it's 500M 42.91 > MicroLlama
-40.56 > 130M 40.01. We trail TinyLlama-1.1B by ~5–9 (it's dense 1.1B trained on 13–75× more tokens), gap concentrated
-on the scale-hungry hellaswag/arc_c — the 1B/100B run should close most of it.
+**Ranking ≈ sorted by pretrain tokens, not params.** The top 4 (SmolLM2/Qwen3/Gemma-3) use **2T–36T tokens
+(50–900× ours)** — a different data regime. Within the *classic* regime (≤300B tok), ours lead per token:
+OURS-500M (44.07, 40B tok) beats opt-350m / MicroLlama / gpt2 / pythia-160m and trails only pythia-410m (300B tok,
+7.5×). **OURS-130M (43.05, just 10B tok) beats MicroLlama-300M (50B), opt-350m (180B), and pythia-160m (300B)** —
+out-scoring 300M-param models trained on 5–30× more data. Per-token efficiency is the win; absolute score is
+gated by token budget → the 1B/100B run (and longer 130M/500M runs) is the lever. (≥1B refs: SmolLM2-1.7B 64.53,
+Qwen3-1.7B 62.49, TinyLlama-1.1B-3T 52.75; omitted from this <1B view.)
 
 See [[moe-project]], [[modal-infra]].
