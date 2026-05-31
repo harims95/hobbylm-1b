@@ -237,6 +237,9 @@ class MoETransformer(nn.Module):
         # FP8 head must be untied (it stores the weight transposed, (d, vocab), for fp8 grad layout).
         self.fp8_head = cfg.fp8_head
         if cfg.fp8_head:
+            import warnings
+            warnings.warn("fp8_head is EXPERIMENTAL/BROKEN: zero gradient flows through the FP8 "
+                          "backward (model won't train) and it gave no speedup. Use fused_ce instead.")
             self.lm_head = FP8Linear(cfg.d_model, cfg.vocab_size,
                                      x_s=cfg.fp8_x_scale, w_s=cfg.fp8_w_scale, grad_s=cfg.fp8_grad_scale)
         else:

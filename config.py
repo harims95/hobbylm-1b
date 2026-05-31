@@ -53,7 +53,8 @@ class ModelConfig:
     # ---- throughput opts (nanogpt-inspired; see docs/ARCHITECTURE_RESEARCH.md §8) ----
     fused_ce: bool = False             # chunked cross-entropy: never materialize the full (T,vocab) fp32 logits
     ce_chunk: int = 4096               # rows per CE chunk (fused_ce only)
-    fp8_head: bool = False             # FP8 (torch._scaled_mm) lm_head; UNTIES the head (own d x vocab weight)
+    fp8_head: bool = False             # EXPERIMENTAL/BROKEN: FP8 lm_head (untied). No speedup at 1B + zero-grad
+                                       # backward (loss frozen at init in the 130M ablation). Do not use.
     fp8_x_scale: float = 1.0           # fp8 activation/weight/grad scales (pre-head x is ~unit RMS, so 1.0 is safe)
     fp8_w_scale: float = 1.0
     fp8_grad_scale: float = 1.0

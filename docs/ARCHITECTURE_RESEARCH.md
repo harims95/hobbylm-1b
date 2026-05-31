@@ -130,4 +130,32 @@ Weights `/data/runs/500M_40B/model.pt` (+ ckpt_5000..35000). Scaling holds: 130M
 FineWeb / FineWeb-Edu 10B (modded-nanogpt `data/cached_fineweb10B.py`), GPT-2 tokenizer (vocab 50257→50304),
 target metric = val cross-entropy (modded-nanogpt uses 3.28 on FineWeb val). Track active-param efficiency.
 
+## 8. Throughput optimizations (nanogpt-inspired) — 2026-05-31
+Ported the *applicable* speed techniques from modded-nanogpt's flagship `train_gpt.py` into the clean
+codebase (its FP8/Triton/FlashAttn-3/varlen stack is too entangled to fork wholesale). All are flag-gated;
+defaults preserve the exact original training math.
+
+**Always-on (numerics-identical):**
+- **On-device loss accumulation** — the old loop called `loss.item()` every micro-step, forcing a
+  device->host sync that serialized grad accumulation. Now accumulate a GPU scalar, sync once per log.
+- **`PYTORCH_ALLOC_CONF=expandable_segments:True`** — less allocator fragmentation -> fits a bigger batch.
+- **CUDA data prefetch** (`CUDAPrefetcher`) — double-buffers the H2D copy on a side stream to overlap
+  with compute (data loader yields pinned host tensors).
+
+**Opt-in (`--opts` / config flags):**
+- **`fused_ce`** (numerics-preserving) — vocab projection + CE done in row-chunks under activation
+  checkpointing, so the full `(T, vocab)` fp32 logit tensor (~1.6 GB at the 1B micro-batch) is never
+  materialized or saved for backward. Verified **bit-identical** loss & grads vs the baseline CE on CPU.
+- **`polar`** — Polar Express orthogonalization schedule in Muon (arXiv:2505.16932): a tuned 5-iteration
+  coefficient sequence that converges the Newton-Schulz step faster (tighter singular values toward 1).
+- **`fp8`** — FP8 (`torch._scaled_mm`, e4m3 fwd / e5m2 bwd) on the lm_head, the single largest GEMM.
+  Stored transposed for a natural grad layout (per @YouJiacheng); **unties** the head (+`vocab x d` params),
+  copy-initialized from the embedding for a fair start. Numerics change -> validated by the quality ablation.
+- **`all_safe`** = `fused_ce`+`polar` (recommended for the real 1B run) · **`all_max`** = `fp8`+`polar`.
+
+Harness: `--action speedtest` (synthetic ms/step + tok/s + peak-mem table at any preset) and
+`--action ablate_opts` (short real-data val-loss ablation across variants). CPU checks in `test_speedups.py`.
+
+<!-- RESULTS_PLACEHOLDER -->
+
 See [[moe-project]], [[modal-infra]].

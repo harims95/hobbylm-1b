@@ -42,9 +42,29 @@ python -m modal run modal_train.py --action train --preset 1B --gpus 8 --steps 2
 # run the focused ablation suite (10 runs at 130M, in parallel)
 python -m modal run modal_train.py --action ablate --steps 3000
 python -m modal run modal_train.py --action results   # leaderboard by final val loss
+
+# train with throughput optimizations (see below)
+python -m modal run modal_train.py --action train --preset 1B --gpus 8 --opts all_safe
 ```
 
 ## Ablations (each changes ONE thing vs the 130M baseline)
 `softmax` gating · `aux_loss` (classic balance) · `shared1` (shared expert) · `no_qknorm` ·
 `no_renorm` (top-k gate renorm) · `topk8` · `experts16` · `no_zloss` · `scale_emb`.
 Winners get promoted into the 500M/1B configs.
+
+## Throughput optimizations (nanogpt-inspired)
+Flag-gated speedups; see `docs/ARCHITECTURE_RESEARCH.md` §8. Always-on (numerics-identical):
+on-device loss accumulation (no per-micro sync), `expandable_segments` allocator, CUDA data
+prefetch. Opt-in via `--opts`:
+- **`fused_ce`** — chunked, checkpointed cross-entropy; never materializes the `(T,vocab)` fp32
+  logit tensor. Bit-identical loss, big memory headroom → larger batch. *(numerics-preserving)*
+- **`polar`** — Polar Express orthogonalizer in Muon (faster-converging than Newton-Schulz).
+- **`fp8`** — FP8 (`torch._scaled_mm`) lm_head, the largest GEMM. Unties the head (+`vocab×d` params).
+- **`all_safe`** = `fused_ce`+`polar` (recommended for the 1B) · **`all_max`** = `fp8`+`polar`.
+
+```bash
+# synthetic throughput probe at target scale (ms/step, tok/s, peak GB, speedup table)
+python -m modal run modal_train.py --action speedtest --preset 1B
+# quality ablation: short real 130M runs per variant -> final val loss
+python -m modal run modal_train.py --action ablate_opts --preset 130M --steps 800
+```

@@ -58,15 +58,18 @@ def download(chunks: int = 10, dataset: str = "10B"):
 
 
 # ---- throughput-optimization presets: (model-config --set overrides, orthogonalizer) ----
-# fused_ce and fp8_head are mutually exclusive (the fp8 head produces full logits; the chunked
-# CE recomputes them) so "all_safe" keeps the CE memory win + polar, "all_max" uses fp8 + polar.
+# SHIPPING: all_safe (fused_ce + polar). fused_ce is the win: +6% step time, -21% peak memory,
+# enables ~2x larger batch, numerics-identical.
+# EXPERIMENTAL (not recommended): fp8 / all_max. The fp8 head gave NO speedup at 1B, OOM'd at large
+# batch, added 51M params, and — as the 130M ablation showed — does not train (zero gradient flows
+# back through mm_t_backward, loss frozen at init). Kept here only for reference; needs a backward fix.
 OPT_PRESETS: dict[str, tuple[list, str]] = {
     "baseline": ([], "ns5"),
     "fused_ce": (["fused_ce=true"], "ns5"),
-    "fp8":      (["fp8_head=true"], "ns5"),
     "polar":    ([], "polar"),
     "all_safe": (["fused_ce=true"], "polar"),
-    "all_max":  (["fp8_head=true"], "polar"),
+    "fp8":      (["fp8_head=true"], "ns5"),       # experimental — broken, see note above
+    "all_max":  (["fp8_head=true"], "polar"),     # experimental — broken
 }
 
 
@@ -179,7 +182,9 @@ def speed_probe(preset: str = "1B", opts: str = "baseline", steps: int = 25, war
                 micro: int = 8, seq_len: int = 1024):
     """Synthetic throughput probe (no data needed): measures ms/step, tokens/s and peak memory
     for one optimization preset at the target model scale. accum=1, random tokens."""
-    import os, sys, time, torch
+    import os
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")  # always-on opt; set before torch
+    import sys, time, torch
     os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
     from config import get_config, TrainConfig
     from model import MoETransformer, count_params
@@ -282,7 +287,7 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
                   save_every, data_dir, opts)
     elif action == "speedtest":
         # synthetic throughput probe at the target scale (default 1B); one H100 per variant, parallel.
-        variants = ["baseline", "fused_ce", "fp8", "polar", "all_safe", "all_max"]
+        variants = ["baseline", "fused_ce", "polar", "all_safe"]  # fp8 dropped: no speedup + zero-grad (see OPT_PRESETS)
         args_t = [(preset, ov, steps if steps != 4000 else 25, 10, micro if micro != 16 else 8, seq_len)
                   for ov in variants]
         print(f"speed probe at {preset} (micro={args_t[0][4]}x{seq_len}) for {len(variants)} variants...",
@@ -307,7 +312,7 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
                   f"{r['peak_gb']:>8.1f} | {sp:>8} | {r['total_M']:>9.1f}")
     elif action == "ablate_opts":
         # quality ablation: short real-data training at `preset` for each optimization variant.
-        variants = ["baseline", "fused_ce", "fp8", "polar", "all_safe", "all_max"]
+        variants = ["baseline", "fused_ce", "polar", "all_safe"]  # fp8 dropped: no speedup + zero-grad (see OPT_PRESETS)
         st = steps if steps != 4000 else 800
         args_t = [(preset, st, f"opt_{v}", "", micro, seq_len, batch_tokens, 0, data_dir, v)
                   for v in variants]
