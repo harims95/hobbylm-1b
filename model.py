@@ -94,8 +94,9 @@ class FP8Linear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.training and x.is_cuda:
-            flat = x.flatten(0, -2).bfloat16()
-            out = torch.ops.moelab.mm_t(flat, self.weight.bfloat16(), self.x_s, self.w_s, self.grad_s)[0]
+            flat = x.flatten(0, -2).bfloat16().contiguous()
+            out = torch.ops.moelab.mm_t(flat, self.weight.bfloat16().contiguous(),
+                                        self.x_s, self.w_s, self.grad_s)[0]
             return out.reshape(*x.shape[:-1], self.out_features)
         return x @ self.weight.type_as(x)
 
