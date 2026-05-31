@@ -216,4 +216,22 @@ defined, else acc. (Active params: 130M→62M, 500M→169M; both near GPT-2-smal
 lower val loss (3.03 vs 3.30). arc_challenge/winogrande sit at chance for both (expected at this scale); boolq
 hovers near the majority-class baseline (noisy for base models). Results saved to `runs/<name>/lm_eval.json`.
 
+**Comparison vs published small models** (same 7-task avg: HellaSwag/Obqa/WinoGrande/ARC_c/ARC_e/boolq/piqa,
+0-shot acc_norm|acc — the TinyLlama eval convention). Our 7-task avgs: **500M_40B = 44.07, 130M_10B = 43.05**.
+
+| model | params | tokens | 7-task avg |
+|---|---|---|---|
+| TinyLlama-1.1B (3T) | 1.1B dense | 3T | 52.99 |
+| TinyLlama-1.1B-Chat | 1.1B dense | 503B | 49.57 |
+| **our 500M_40B** | 500M / 169M act | 40B | **44.07** |
+| **our 130M_10B** | 140M / 62M act | 10B | **43.05** |
+| MicroLlama | 300M dense | 50B | 42.36 |
+| bert-large-uncased | 340M | — | 34.26 |
+
+**Headline: our 500M beats MicroLlama-300M (44.07 vs 42.36) on fewer tokens (40B vs 50B) and ~half the active
+params (169M vs 300M)** — winning the LM-driven tasks (hellaswag 41.5 vs 34.3, arc_e 42.7 vs 39.1, piqa 69.6 vs
+64.6). Honest caveat: the 130M's edge is boolq-inflated; excluding boolq (6-task avg) it's 500M 42.91 > MicroLlama
+40.56 > 130M 40.01. We trail TinyLlama-1.1B by ~5–9 (it's dense 1.1B trained on 13–75× more tokens), gap concentrated
+on the scale-hungry hellaswag/arc_c — the 1B/100B run should close most of it.
+
 See [[moe-project]], [[modal-infra]].
