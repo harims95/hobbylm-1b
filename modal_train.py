@@ -35,11 +35,14 @@ eval_image = (
     .pip_install("torch==2.12.0", "numpy", "tiktoken", "lm-eval==0.4.9.1",
                  "transformers>=4.50,<5", "datasets", "huggingface-hub", "accelerate", "sentencepiece")
     # transformers <5 (lm-eval needs AutoModelForVision2Seq) but >=4.50 (for Gemma-3 / Qwen2.5 archs)
-    .env({"HF_HUB_DISABLE_XET": "1"})  # route downloads via std CDN (xet-read-token endpoint rate-limits under parallelism)
+    # route downloads via std CDN (xet endpoint rate-limits under parallelism); cache datasets/models
+    # on a shared volume so parallel eval containers don't each re-download (avoids HF 429s).
+    .env({"HF_HUB_DISABLE_XET": "1", "HF_HOME": "/cache/hf"})
     .add_local_dir(".", "/root/moe-lab")
 )
 
 app = modal.App("moe-lab", image=image)
+hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)  # HF datasets/models cache
 vol = modal.Volume.from_name("fineweb10B", create_if_missing=True)
 
 
@@ -256,7 +259,7 @@ OUR_RESULTS = {
 }
 
 
-@app.function(image=eval_image, gpu="H100", timeout=3 * 60 * 60,
+@app.function(image=eval_image, gpu="H100", timeout=3 * 60 * 60, volumes={"/cache/hf": hf_cache},
               secrets=[modal.Secret.from_name("huggingface")])
 def hf_eval(name: str, model_id: str, tasks: str = EVAL_TASKS_7,
             limit: int = 0, batch_size: str = "auto", num_fewshot: int = 0):
@@ -278,7 +281,7 @@ def hf_eval(name: str, model_id: str, tasks: str = EVAL_TASKS_7,
     return {"name": name, "model_id": model_id, "scores": summary, "avg": avg}
 
 
-@app.function(image=eval_image, gpu="H100", volumes={"/data": vol},
+@app.function(image=eval_image, gpu="H100", volumes={"/data": vol, "/cache/hf": hf_cache},
               timeout=4 * 60 * 60, secrets=[modal.Secret.from_name("huggingface")])
 def lm_eval_run(run_name: str, ckpt: str = "model.pt", tasks: str = EVAL_TASKS,
                 limit: int = 0, batch_size: int = 32, num_fewshot: int = 0):
@@ -329,6 +332,31 @@ def lm_eval_run(run_name: str, ckpt: str = "model.pt", tasks: str = EVAL_TASKS,
     except Exception as e:
         print(f"(could not save lm_eval.json: {e})", flush=True)
     return summary
+
+
+@app.function(image=eval_image, timeout=2 * 60 * 60, volumes={"/cache/hf": hf_cache},
+              secrets=[modal.Secret.from_name("huggingface")])
+def prep_data(tasks: str = "mmlu"):
+    """One-time: download the eval datasets to the shared HF cache volume from a SINGLE container
+    (sequential, no parallel 429 storm). Subsequent parallel evals hit the cache instead of HF."""
+    from lm_eval.tasks import TaskManager, get_task_dict
+    tm = TaskManager()
+    task_list = [t for t in tasks.split(",") if t]
+    print(f"caching datasets for {task_list} ...", flush=True)
+    td = get_task_dict(task_list, tm)   # building tasks triggers dataset download to HF_HOME=/cache/hf
+
+    def _touch(d):
+        for k, v in (d.items() if isinstance(d, dict) else []):
+            if isinstance(v, dict):
+                _touch(v)
+            else:
+                try:
+                    (v.test_docs() or v.validation_docs())
+                except Exception:
+                    pass
+    _touch(td)
+    hf_cache.commit()
+    print(f"cached {len(task_list)} task group(s) to /cache/hf", flush=True)
 
 
 @app.function(gpu="H100", timeout=30 * 60)
@@ -431,6 +459,9 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
          batch_tokens: int = 262144, save_every: int = 0, data: str = "10B",
          opts: str = "baseline", tasks: str = "", limit: int = 0, fewshot: int = 0):
     data_dir = DATASETS[data][1]
+    if action == "prep_data":
+        prep_data.remote(tasks or "mmlu")
+        return
     if action == "lmeval":
         # EleutherAI lm-evaluation-harness on trained checkpoint(s). run_name="both" -> 130M + 500M.
         targets = ["130M_10B", "500M_40B"] if run_name in ("both", "baseline", "") else [run_name]
