@@ -228,8 +228,7 @@ def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: floa
     elif action == "stage1":
         train_stage1.remote(max_steps=max_steps, micro=micro, lr=lr)
     elif action == "stage2":
-        train_stage2.remote(max_steps=(max_steps if max_steps != 1500 else 1200),
-                            micro=(micro if micro != 32 else 16), lr=(lr if lr != 1e-3 else 2e-5))
+        train_stage2.remote(max_steps=max_steps, micro=micro, lr=(2e-5 if lr == 1e-3 else lr))
     elif action == "caption":
         caption.remote(n=n, stage2_run=stage2_run)
     else:

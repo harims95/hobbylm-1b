@@ -60,7 +60,7 @@ class LlavaSFT(Dataset):
     [IMAGE] USER: q1 ASSISTANT: a1<eot> USER: q2 ASSISTANT: a2<eot> ... and trains next-token loss
     ONLY on the assistant answers (+ their EOT); image/scaffolding/user tokens are IGNORE.
     Images streamed from train2017.zip as 'train2017/<image>'."""
-    def __init__(self, json_path: str, zip_path: str, max_len: int = 1280):
+    def __init__(self, json_path: str, zip_path: str, max_len: int = 1024):
         with open(json_path) as f:
             self.data = json.load(f)
         self.zip_path = zip_path
