@@ -7,8 +7,9 @@ so the model learns to produce the caption conditioned on the image.
 """
 from __future__ import annotations
 
+import io
 import json
-import os
+import zipfile
 
 import tiktoken
 import torch
@@ -22,11 +23,19 @@ EOT = 50256
 
 
 class LlavaPretrain(Dataset):
-    def __init__(self, json_path: str, image_root: str, max_cap: int = 128):
+    """Streams images directly from images.zip by name (no extraction). Each DataLoader worker opens
+    its own ZipFile handle lazily (ZipFile isn't fork/thread-safe to share)."""
+    def __init__(self, json_path: str, zip_path: str, max_cap: int = 128):
         with open(json_path) as f:
             self.data = json.load(f)
-        self.image_root = image_root
+        self.zip_path = zip_path
         self.max_cap = max_cap
+        self._zip = None
+
+    def _z(self) -> zipfile.ZipFile:
+        if self._zip is None:                       # opened per-worker after fork
+            self._zip = zipfile.ZipFile(self.zip_path)
+        return self._zip
 
     def __len__(self):
         return len(self.data)
@@ -40,7 +49,7 @@ class LlavaPretrain(Dataset):
         ids = torch.tensor(logical[:-1], dtype=torch.long)
         tgt = torch.tensor(logical[1:], dtype=torch.long)
         try:
-            img = Image.open(os.path.join(self.image_root, ex["image"])).convert("RGB")
+            img = Image.open(io.BytesIO(self._z().read(ex["image"]))).convert("RGB")
         except Exception:
             img = Image.new("RGB", (384, 384))   # tolerate a missing/corrupt image
         return img, ids, tgt

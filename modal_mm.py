@@ -29,27 +29,30 @@ BACKBONE = "/data/runs/500M_ctx2048/model.pt"
 @app.function(image=vlm_image, volumes={"/llava": data_vol, "/cache/hf": hf_cache},
               timeout=6 * 60 * 60, secrets=[HF])
 def download():
-    """Download LLaVA-Pretrain (LAION-CC-SBU-558K): captions json + ~558K images (images.zip ~24GB)."""
+    """Download LLaVA-Pretrain (LAION-CC-SBU-558K): captions json + images.zip (~24GB), kept as ONE file
+    on the volume and STREAMED (random-access by name) at train time — no extracting 558K files."""
     import os, zipfile
     from huggingface_hub import hf_hub_download
     repo = "liuhaotian/LLaVA-Pretrain"
     os.makedirs("/llava", exist_ok=True)
-    for fn in ["blip_laion_cc_sbu_558k.json"]:
-        if not os.path.exists(f"/llava/{fn}"):
-            hf_hub_download(repo, fn, repo_type="dataset", local_dir="/llava")
-            print(f"got {fn}", flush=True)
-    img_dir = "/llava/images"
-    if not os.path.isdir(img_dir) or not os.listdir(img_dir):
-        print("downloading images.zip (~24GB) ...", flush=True)
-        zp = hf_hub_download(repo, "images.zip", repo_type="dataset", local_dir="/llava")
-        print("unzipping ...", flush=True)
-        os.makedirs(img_dir, exist_ok=True)
-        with zipfile.ZipFile(zp) as z:
-            z.extractall(img_dir)
-        os.remove(zp)
+    if not os.path.exists("/llava/blip_laion_cc_sbu_558k.json"):
+        hf_hub_download(repo, "blip_laion_cc_sbu_558k.json", repo_type="dataset", local_dir="/llava")
         data_vol.commit()
-    n = sum(len(fs) for _, _, fs in os.walk(img_dir))
-    print(f"LLaVA-Pretrain ready: {n} image files under {img_dir}", flush=True)
+        print("got captions json", flush=True)
+    if not os.path.exists("/llava/images.zip"):
+        print("downloading images.zip (~24GB) -> volume (no unzip)...", flush=True)
+        hf_hub_download(repo, "images.zip", repo_type="dataset", local_dir="/llava")
+        data_vol.commit()
+    # sanity: open the zip and confirm the first json image is readable by name
+    import json
+    data = json.load(open("/llava/blip_laion_cc_sbu_558k.json"))
+    with zipfile.ZipFile("/llava/images.zip") as z:
+        names = z.namelist()
+        first = data[0]["image"]
+        ok = first in z.NameToInfo
+    sz = os.path.getsize("/llava/images.zip") / 1e9
+    print(f"ready: images.zip ({sz:.1f}GB, {len(names)} entries) + {len(data)} captions | "
+          f"first image '{first}' in zip: {ok}", flush=True)
 
 
 @app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/cache/hf": hf_cache},
@@ -101,7 +104,7 @@ def train_stage1(max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, save_
     out = f"/data/runs/{save_name}"
     cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "vlm_stage1.py",
            "--backbone", BACKBONE, "--json", "/llava/blip_laion_cc_sbu_558k.json",
-           "--images", "/llava/images", "--out", out,
+           "--zip", "/llava/images.zip", "--out", out,
            "--max_steps", str(max_steps), "--micro", str(micro), "--lr", str(lr)]
     print("RUN:", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)

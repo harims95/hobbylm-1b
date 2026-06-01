@@ -24,7 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backbone", required=True)
     ap.add_argument("--json", required=True)
-    ap.add_argument("--images", required=True)
+    ap.add_argument("--zip", required=True, help="images.zip (streamed by name; not extracted)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max_steps", type=int, default=1500)
     ap.add_argument("--micro", type=int, default=32)
@@ -66,7 +66,7 @@ def main():
 
     opt = torch.optim.AdamW(raw.projector_parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
 
-    ds = LlavaPretrain(args.json, args.images)
+    ds = LlavaPretrain(args.json, args.zip)
     sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True) if ddp else None
     dl = DataLoader(ds, batch_size=args.micro, sampler=sampler, shuffle=(sampler is None),
                     num_workers=6, collate_fn=collate, drop_last=True, pin_memory=True, persistent_workers=True)
