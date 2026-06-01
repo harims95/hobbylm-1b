@@ -55,6 +55,31 @@ def download():
           f"first image '{first}' in zip: {ok}", flush=True)
 
 
+@app.function(image=vlm_image, volumes={"/llava": data_vol, "/cache/hf": hf_cache},
+              timeout=6 * 60 * 60, secrets=[HF])
+def download_sft():
+    """Stage-2 data: LLaVA-Instruct-150K (the GPT-4 visual-instruction set) + COCO train2017 images
+    (~18GB, streamed from the zip like stage 1). Single most effective subset of the 665K mix."""
+    import os, json, zipfile, urllib.request
+    from huggingface_hub import hf_hub_download
+    if not os.path.exists("/llava/llava_instruct_150k.json"):
+        hf_hub_download("liuhaotian/LLaVA-Instruct-150K", "llava_instruct_150k.json",
+                        repo_type="dataset", local_dir="/llava")
+        data_vol.commit()
+        print("got llava_instruct_150k.json", flush=True)
+    if not os.path.exists("/llava/train2017.zip"):
+        print("downloading COCO train2017 (~18GB)...", flush=True)
+        urllib.request.urlretrieve("http://images.cocodataset.org/zips/train2017.zip", "/llava/train2017.zip")
+        data_vol.commit()
+    data = json.load(open("/llava/llava_instruct_150k.json"))
+    with zipfile.ZipFile("/llava/train2017.zip") as z:
+        names = z.NameToInfo
+    hit = sum(1 for ex in data[:300] if f"train2017/{ex['image']}" in names)
+    sz = os.path.getsize("/llava/train2017.zip") / 1e9
+    print(f"ready: {len(data)} instructions | COCO train2017.zip {sz:.1f}GB ({len(names)} entries) | "
+          f"hit-rate first 300: {hit}/300", flush=True)
+
+
 @app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/cache/hf": hf_cache},
               timeout=30 * 60, secrets=[HF])
 def smoke():
@@ -170,6 +195,8 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
 def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, n: int = 8):
     if action == "download":
         download.remote()
+    elif action == "download_sft":
+        download_sft.remote()
     elif action == "smoke":
         smoke.remote()
     elif action == "stage1":
