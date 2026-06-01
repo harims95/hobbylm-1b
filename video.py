@@ -13,20 +13,24 @@ from vision import SiglipVision
 
 
 class SiglipVideo:
-    def __init__(self, siglip: SiglipVision, pool_hw: tuple[int, int] = (6, 6)):
+    def __init__(self, siglip: SiglipVision, pool_hw: tuple[int, int] | None = None):
         self.siglip = siglip                 # reuse the frozen image encoder
-        self.pool_hw = pool_hw               # per-frame spatial pool target (6x6 = 36 tokens/frame)
+        # pool_hw=None -> keep RAW 729 patch tokens/frame (matches what mm_projector was trained on;
+        # POOLED tokens are out-of-distribution and produce garbage). Few frames to fit 2048 ctx.
+        self.pool_hw = pool_hw
 
     @torch.no_grad()
     def encode_frames(self, frames) -> torch.Tensor:
-        """frames: list of PIL.Image (one video). Returns (1, n_frames*H*W, hidden) video tokens."""
+        """frames: list of PIL.Image (one video). Returns (1, n_frames*tokens, hidden) video tokens."""
         feats = self.siglip.encode(frames)            # (N, 729, C)
         N, T, C = feats.shape
-        side = int(round(T ** 0.5))                   # 27 for SigLIP2-so400m-384 (27x27)
-        f = feats[:, :side * side, :].reshape(N, side, side, C).permute(0, 3, 1, 2)  # (N,C,side,side)
-        f = F.adaptive_avg_pool2d(f.float(), self.pool_hw).to(feats.dtype)           # (N,C,h,w)
-        f = f.flatten(2).transpose(1, 2)              # (N, h*w, C)
-        return f.reshape(1, -1, C)                    # (1, N*h*w, C) — one video's tokens
+        if self.pool_hw is None:
+            return feats.reshape(1, N * T, C)         # raw tokens, in-distribution for mm_projector
+        side = int(round(T ** 0.5))
+        f = feats[:, :side * side, :].reshape(N, side, side, C).permute(0, 3, 1, 2)
+        f = F.adaptive_avg_pool2d(f.float(), self.pool_hw).to(feats.dtype)
+        f = f.flatten(2).transpose(1, 2)
+        return f.reshape(1, -1, C)
 
 
 def sample_frames(path: str, n: int = 8):

@@ -457,7 +457,7 @@ def unified(stage2_run: str = "500M_vlm_stage2", audio_run: str = "500M_vlm_audi
         ex = laion[(k * 7919) % len(laion)]
         img = Image.open(io.BytesIO(imgzip.read(ex["image"]))).convert("RGB")
         ifeats = vis.encode([img])
-        vfeats = vid.encode_frames([img] * 4)                          # static 4-frame "video" of the image
+        vfeats = vid.encode_frames([img] * 2)            # 2 frames x 729 = 1458 raw tokens (fits 2048 ctx)
         wav, agt = clotho.raw((k * 619) % len(clotho))
         afeats = aud.encode([wav])
         print(f"\n=== sample {k} ===", flush=True)
