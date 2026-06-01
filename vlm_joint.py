@@ -90,7 +90,9 @@ def main():
 
     raw = vlm
     if ddp:
-        vlm = DDP(vlm, device_ids=[local])
+        # find_unused_parameters: each step uses only ONE projector (image/video->mm, audio->audio),
+        # so the other projector gets no grad that step -> DDP must tolerate unused params.
+        vlm = DDP(vlm, device_ids=[local], find_unused_parameters=True)
 
     proj_ids = {id(p) for p in raw.mm_projector.parameters()} | {id(p) for p in raw.audio_projector.parameters()}
     proj = [p for p in raw.parameters() if p.requires_grad and id(p) in proj_ids]
