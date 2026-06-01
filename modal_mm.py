@@ -186,7 +186,12 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
     tok = tiktoken.get_encoding("gpt2")
     data = json.load(open("/llava/blip_laion_cc_sbu_558k.json"))
     z = zipfile.ZipFile("/llava/images.zip")
-    pre = tok.encode_ordinary(prompt) if prompt else []
+    if stage2_run:                                   # stage-2 expects the chat format it was trained on
+        q = prompt or "Describe this image in detail."
+        pre = tok.encode_ordinary(f"USER: {q}\nASSISTANT:")
+        print(f"prompt: USER: {q}", flush=True)
+    else:
+        pre = tok.encode_ordinary(prompt) if prompt else []
 
     @torch.no_grad()
     def gen(image):
