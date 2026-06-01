@@ -13,7 +13,7 @@ vlm_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.12.0", "transformers>=4.50,<5", "pillow", "numpy",
                  "huggingface-hub", "accelerate", "sentencepiece", "tiktoken",
-                 "soundfile", "librosa")   # librosa/soundfile for audio (Phase 3)
+                 "soundfile", "librosa", "datasets")   # audio (Phase 3) + HF datasets for Clotho
     .env({"HF_HUB_DISABLE_XET": "1", "HF_HOME": "/cache/hf"})
     .add_local_dir(".", "/root/moe-lab")
 )
