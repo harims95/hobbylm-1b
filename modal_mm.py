@@ -123,7 +123,7 @@ def train_stage1(max_steps: int = 2000, micro: int = 24, lr: float = 1e-3, warmu
     print(f"dataset={len(ds)} samples | micro={micro} | max_steps={max_steps}", flush=True)
 
     vlm.train()
-    step, t0, run = 0, time.time(), 0.0
+    step, t0, run, last = 0, time.time(), 0.0, float("nan")
     done = False
     while not done:
         for imgs, ids, tgt in dl:
@@ -138,7 +138,8 @@ def train_stage1(max_steps: int = 2000, micro: int = 24, lr: float = 1e-3, warmu
             loss.backward()
             torch.nn.utils.clip_grad_norm_(vlm.projector_parameters(), 1.0)
             opt.step()
-            run += loss.item()
+            last = loss.item()
+            run += last
             if step % log_every == 0:
                 dt = (time.time() - t0) / (step + 1)
                 print(f"step {step:5d} | loss {loss.item():.4f} | avg {run/(step+1):.4f} | "
@@ -153,8 +154,8 @@ def train_stage1(max_steps: int = 2000, micro: int = 24, lr: float = 1e-3, warmu
     torch.save({"projector": vlm.mm_projector.state_dict(), "vision_dim": enc.hidden,
                 "backbone": BACKBONE, "steps": step}, f"{out}/projector.pt")
     runs_vol.commit()
-    print(f"saved projector -> {out}/projector.pt  (final loss {loss.item():.4f})", flush=True)
-    return {"final_loss": loss.item(), "steps": step}
+    print(f"saved projector -> {out}/projector.pt  (final loss {last:.4f})", flush=True)
+    return {"final_loss": last, "steps": step}
 
 
 @app.local_entrypoint()
