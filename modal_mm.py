@@ -137,9 +137,28 @@ def train_stage1(max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, save_
     return {"out": out, "steps": max_steps}
 
 
+@app.function(image=vlm_image, gpu="H100:8", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
+              timeout=12 * 60 * 60, secrets=[HF])
+def train_stage2(max_steps: int = 1200, micro: int = 16, lr: float = 2e-5, save_name: str = "500M_vlm_stage2",
+                 stage1_run: str = "500M_vlm_stage1"):
+    """Stage 2 (SFT) on 8x H100 via torchrun: instruction-tune projector + LLM on LLaVA-Instruct-150K."""
+    import os, subprocess
+    os.chdir("/root/moe-lab")
+    out = f"/data/runs/{save_name}"
+    cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "vlm_stage2.py",
+           "--backbone", BACKBONE, "--stage1", f"/data/runs/{stage1_run}/projector.pt",
+           "--json", "/llava/llava_instruct_150k.json", "--zip", "/llava/train2017.zip", "--out", out,
+           "--max_steps", str(max_steps), "--micro", str(micro), "--lr", str(lr)]
+    print("RUN:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    runs_vol.commit()
+    return {"out": out, "steps": max_steps}
+
+
 @app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
               timeout=30 * 60, secrets=[HF])
-def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, prompt: str = ""):
+def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, prompt: str = "",
+            stage2_run: str = ""):
     """Greedy-caption a few real LAION images with the stage-1 VLM; print predicted vs ground-truth."""
     import os, sys, io, json, zipfile, torch
     os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
@@ -153,10 +172,16 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
     enc = SiglipVision(device=dev)
     llm, cfg, _, _ = load_model(BACKBONE, dev)
     vlm = MoEVLM(llm, vision_dim=enc.hidden).to(dev)
-    ck = torch.load(f"/data/runs/{stage1_run}/projector.pt", map_location=dev, weights_only=False)
-    vlm.mm_projector.load_state_dict(ck["projector"])
+    if stage2_run:
+        ck = torch.load(f"/data/runs/{stage2_run}/model.pt", map_location=dev, weights_only=False)
+        vlm.llm.load_state_dict(ck["model"])              # stage-2 finetuned LLM
+        vlm.mm_projector.load_state_dict(ck["projector"])
+        print(f"loaded stage-2 VLM from {stage2_run}", flush=True)
+    else:
+        ck = torch.load(f"/data/runs/{stage1_run}/projector.pt", map_location=dev, weights_only=False)
+        vlm.mm_projector.load_state_dict(ck["projector"])
+        print(f"loaded stage-1 projector (steps={ck.get('steps')})", flush=True)
     vlm.eval()
-    print(f"loaded projector (steps={ck.get('steps')})", flush=True)
 
     tok = tiktoken.get_encoding("gpt2")
     data = json.load(open("/llava/blip_laion_cc_sbu_558k.json"))
@@ -192,7 +217,8 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
 
 
 @app.local_entrypoint()
-def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, n: int = 8):
+def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, n: int = 8,
+         stage2_run: str = ""):
     if action == "download":
         download.remote()
     elif action == "download_sft":
@@ -201,7 +227,11 @@ def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: floa
         smoke.remote()
     elif action == "stage1":
         train_stage1.remote(max_steps=max_steps, micro=micro, lr=lr)
+    elif action == "stage2":
+        train_stage2.remote(max_steps=(max_steps if max_steps != 1500 else 1200),
+                            micro=(micro if micro != 32 else 16), lr=(lr if lr != 1e-3 else 2e-5))
     elif action == "caption":
-        caption.remote(n=n)
+        caption.remote(n=n, stage2_run=stage2_run)
     else:
-        raise SystemExit(f"unknown action {action!r} (use download|smoke|stage1)")
+        raise SystemExit(f"unknown action {action!r} "
+                         "(use download|download_sft|smoke|stage1|stage2|caption)")

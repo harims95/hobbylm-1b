@@ -139,6 +139,30 @@ def test_target_alignment():
     print("    OK (last feature target=c0, then c1, eot)")
 
 
+def test_sft_masking():
+    print("[8] SFT data: loss only on assistant answer tokens, next-token aligned")
+    import io, json, os, tempfile, zipfile
+    from PIL import Image
+    from vlm_data import LlavaSFT, ENC, EOT
+    d = tempfile.mkdtemp()
+    sample = {"id": "x", "image": "000000000001.jpg", "conversations": [
+        {"from": "human", "value": "<image>\nWhat is this?"},
+        {"from": "gpt", "value": "A cat."}]}
+    jp = os.path.join(d, "i.json"); json.dump([sample], open(jp, "w"))
+    zp = os.path.join(d, "img.zip")
+    with zipfile.ZipFile(zp, "w") as z:
+        b = io.BytesIO(); Image.new("RGB", (8, 8)).save(b, format="JPEG")
+        z.writestr("train2017/000000000001.jpg", b.getvalue())
+    ds = LlavaSFT(jp, zp)
+    img, ids, tgt = ds[0]
+    ans = ENC.encode_ordinary(" A cat.") + [EOT]
+    nz = tgt[tgt != IGNORE_INDEX].tolist()
+    print(f"    ids[0]={ids[0].item()} (IMAGE_TOKEN={IMAGE_TOKEN}) | trainable targets={len(nz)} | answer={len(ans)}")
+    assert ids[0].item() == IMAGE_TOKEN
+    assert nz == ans                       # only the assistant answer is supervised, in order
+    print("    OK")
+
+
 def test_stage1_freeze():
     print("[5] stage-1 freeze: only projector trains")
     vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=1152)
@@ -157,5 +181,6 @@ if __name__ == "__main__":
     test_mixed_batch()
     test_dtype_mismatch()
     test_target_alignment()
+    test_sft_masking()
     test_stage1_freeze()
     print("\nALL VLM PLUMBING TESTS PASSED")

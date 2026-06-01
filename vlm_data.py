@@ -55,6 +55,53 @@ class LlavaPretrain(Dataset):
         return img, ids, tgt
 
 
+class LlavaSFT(Dataset):
+    """LLaVA-Instruct-150K instruction tuning. Builds a multi-turn sequence
+    [IMAGE] USER: q1 ASSISTANT: a1<eot> USER: q2 ASSISTANT: a2<eot> ... and trains next-token loss
+    ONLY on the assistant answers (+ their EOT); image/scaffolding/user tokens are IGNORE.
+    Images streamed from train2017.zip as 'train2017/<image>'."""
+    def __init__(self, json_path: str, zip_path: str, max_len: int = 1280):
+        with open(json_path) as f:
+            self.data = json.load(f)
+        self.zip_path = zip_path
+        self.max_len = max_len
+        self._zip = None
+
+    def _z(self) -> zipfile.ZipFile:
+        if self._zip is None:
+            self._zip = zipfile.ZipFile(self.zip_path)
+        return self._zip
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, i):
+        ex = self.data[i]
+        # logical token stream + a per-token "is assistant answer" mask
+        logical = [IMAGE_TOKEN]
+        mask = [False]
+        for turn in ex["conversations"]:
+            val = turn["value"].replace("<image>", "").strip()
+            if turn["from"] == "human":
+                t = ENC.encode_ordinary("USER: " + val + "\nASSISTANT:")
+                logical += t
+                mask += [False] * len(t)
+            else:  # gpt / assistant
+                t = ENC.encode_ordinary(" " + val) + [EOT]
+                logical += t
+                mask += [True] * len(t)            # train on the answer (+ EOT)
+        logical, mask = logical[:self.max_len], mask[:self.max_len]
+        # next-token: input=logical[:-1], target=logical[1:] but only where the TARGET is an answer token
+        ids = torch.tensor(logical[:-1], dtype=torch.long)
+        tgt = torch.tensor([logical[k + 1] if mask[k + 1] else IGNORE_INDEX
+                            for k in range(len(logical) - 1)], dtype=torch.long)
+        try:
+            img = Image.open(io.BytesIO(self._z().read("train2017/" + ex["image"]))).convert("RGB")
+        except Exception:
+            img = Image.new("RGB", (384, 384))
+        return img, ids, tgt
+
+
 def collate(batch):
     """Pad input_ids (with EOT) and targets (with IGNORE) to the batch max; return (PIL list, ids, tgt)."""
     imgs, ids, tgts = zip(*batch)
