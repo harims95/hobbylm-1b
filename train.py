@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"],
                     help="Muon orthogonalizer: ns5 (Newton-Schulz) or polar (Polar Express)")
+    ap.add_argument("--init_from", default="", help="checkpoint .pt to resume model weights from (continued pretrain)")
+    ap.add_argument("--lr_mult", type=float, default=1.0, help="multiply base LRs (use <1 for finetune/ctx-extension)")
     ap.add_argument("--set", nargs="*", default=[], help="model config overrides key=value")
     args = ap.parse_args()
 
@@ -98,7 +100,7 @@ def main():
     # auto sqrt-scale LR vs the ablation reference batch (262144 tokens), so larger
     # multi-GPU batches stay principled without per-run retuning.
     REF_BATCH = 262144
-    lr_scale = (tc.batch_tokens / REF_BATCH) ** 0.5
+    lr_scale = (tc.batch_tokens / REF_BATCH) ** 0.5 * args.lr_mult
     tc.muon_lr *= lr_scale
     tc.adam_lr *= lr_scale
 
@@ -111,6 +113,12 @@ def main():
         cfg.expert_backend = "bmm"   # grouped_mm needs CUDA bf16
 
     model = MoETransformer(cfg).to(device)   # fp32 master weights; bf16 via autocast
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        log(f"resumed weights from {args.init_from} "
+            f"(prev step={ck.get('step')}, val={ck.get('val_loss')}; "
+            f"missing={len(missing)} unexpected={len(unexpected)})")
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
            if device.type == "cuda" and tc.bf16 else nullcontext())
     pc = count_params(model)

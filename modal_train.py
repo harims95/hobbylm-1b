@@ -88,19 +88,24 @@ OPT_PRESETS: dict[str, tuple[list, str]] = {
 
 
 def _train_body(preset, steps, run_name, overrides, gpus, micro, seq_len, batch_tokens,
-                save_every=0, data_dir=DATA_DIR, opts="baseline"):
+                save_every=0, data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
     import os
     os.chdir("/root/moe-lab")
     opt_sets, orthog = OPT_PRESETS.get(opts, ([], "ns5"))
     user_sets = overrides.split(",") if overrides else []
     all_sets = [*opt_sets, *user_sets]
     over = ["--set", *all_sets] if all_sets else []
+    extra = []
+    if init_from:
+        extra += ["--init_from", init_from]
+    if lr_mult != 1.0:
+        extra += ["--lr_mult", str(lr_mult)]
     cmd = [
         "torchrun", "--standalone", f"--nproc_per_node={gpus}", "train.py",
         "--preset", preset, "--run_name", run_name, "--data_dir", data_dir,
         "--out_dir", "/data/runs", "--max_steps", str(steps), "--micro_batch_seqs", str(micro),
         "--seq_len", str(seq_len), "--batch_tokens", str(batch_tokens),
-        "--orthogonalizer", orthog, "--save_every", str(save_every), *over,
+        "--orthogonalizer", orthog, "--save_every", str(save_every), *extra, *over,
     ]
     print("RUN:", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
@@ -179,16 +184,16 @@ def specdecode(draft_run: str = "130M_10B", target_run: str = "500M_40B", K: int
 
 @app.function(gpu="H100", volumes={"/data": vol}, timeout=24 * 60 * 60)
 def train_1(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
-            data_dir=DATA_DIR, opts="baseline"):
+            data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
     return _train_body(preset, steps, run_name, overrides, 1, micro, seq_len, batch_tokens,
-                       save_every, data_dir, opts)
+                       save_every, data_dir, opts, init_from, lr_mult)
 
 
 @app.function(gpu="H100:8", volumes={"/data": vol}, timeout=24 * 60 * 60)
 def train_8(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
-            data_dir=DATA_DIR, opts="baseline"):
+            data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
     return _train_body(preset, steps, run_name, overrides, 8, micro, seq_len, batch_tokens,
-                       save_every, data_dir, opts)
+                       save_every, data_dir, opts, init_from, lr_mult)
 
 
 # default benchmark suite for small models (all loglikelihood / multiple-choice, GPT-2/Pythia-style)
@@ -457,7 +462,8 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
          run_name: str = "baseline", overrides: str = "", gpus: int = 1,
          chunks: int = 10, micro: int = 16, seq_len: int = 1024,
          batch_tokens: int = 262144, save_every: int = 0, data: str = "10B",
-         opts: str = "baseline", tasks: str = "", limit: int = 0, fewshot: int = 0):
+         opts: str = "baseline", tasks: str = "", limit: int = 0, fewshot: int = 0,
+         init_from: str = "", lr_mult: float = 1.0):
     data_dir = DATASETS[data][1]
     if action == "prep_data":
         prep_data.remote(tasks or "mmlu")
@@ -526,7 +532,7 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
     elif action == "train":
         fn = train_8 if gpus == 8 else train_1
         fn.remote(preset, steps, run_name, overrides, micro, seq_len, batch_tokens,
-                  save_every, data_dir, opts)
+                  save_every, data_dir, opts, init_from, lr_mult)
     elif action == "speedtest":
         # synthetic throughput probe at the target scale (default 1B); one H100 per variant, parallel.
         variants = ["baseline", "fused_ce", "polar", "all_safe"]  # fp8 dropped: no speedup + zero-grad (see OPT_PRESETS)
