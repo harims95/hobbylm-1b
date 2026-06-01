@@ -92,74 +92,25 @@ def smoke():
     print("VISION SMOKE OK", flush=True)
 
 
-@app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
+@app.function(image=vlm_image, gpu="H100:8", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
               timeout=12 * 60 * 60, secrets=[HF])
-def train_stage1(max_steps: int = 2000, micro: int = 24, lr: float = 1e-3, warmup: int = 100,
-                 save_name: str = "500M_vlm_stage1", log_every: int = 20):
-    """Stage 1 (alignment): train ONLY the projector on LAION-CC-SBU-558K; LLM + SigLIP2 frozen."""
-    import os, sys, time, torch
-    os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
-    from torch.utils.data import DataLoader
-    from vision import SiglipVision
-    from multimodal import MoEVLM
-    from generate import load_model
-    from vlm_data import LlavaPretrain, collate
-
-    dev = torch.device("cuda")
-    torch.manual_seed(0)
-    torch.set_float32_matmul_precision("high")
-    enc = SiglipVision(device=dev)
-    llm, cfg, vloss, _ = load_model(BACKBONE, dev)
-    vlm = MoEVLM(llm, vision_dim=enc.hidden).to(dev)
-    vlm.set_llm_trainable(False)                      # stage 1: projector only
-    n_proj = sum(p.numel() for p in vlm.projector_parameters())
-    print(f"backbone d{cfg.d_model} val={vloss:.3f} | SigLIP2 hidden={enc.hidden} | projector params={n_proj/1e6:.2f}M",
-          flush=True)
-    opt = torch.optim.AdamW(vlm.projector_parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
-
-    ds = LlavaPretrain("/llava/blip_laion_cc_sbu_558k.json", "/llava/images")
-    dl = DataLoader(ds, batch_size=micro, shuffle=True, num_workers=8, collate_fn=collate,
-                    drop_last=True, pin_memory=True, persistent_workers=True)
-    print(f"dataset={len(ds)} samples | micro={micro} | max_steps={max_steps}", flush=True)
-
-    vlm.train()
-    step, t0, run, last = 0, time.time(), 0.0, float("nan")
-    done = False
-    while not done:
-        for imgs, ids, tgt in dl:
-            ids, tgt = ids.to(dev), tgt.to(dev)
-            for g in opt.param_groups:
-                g["lr"] = lr * min(1.0, (step + 1) / warmup)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                feats = enc.encode_pixels(enc.preprocess(imgs))
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, parts = vlm(ids, image_features=feats, targets=tgt)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(vlm.projector_parameters(), 1.0)
-            opt.step()
-            last = loss.item()
-            run += last
-            if step % log_every == 0:
-                dt = (time.time() - t0) / (step + 1)
-                print(f"step {step:5d} | loss {loss.item():.4f} | avg {run/(step+1):.4f} | "
-                      f"lr {opt.param_groups[0]['lr']:.2e} | {dt*1000:.0f}ms/step", flush=True)
-            step += 1
-            if step >= max_steps:
-                done = True
-                break
-
+def train_stage1(max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, save_name: str = "500M_vlm_stage1"):
+    """Stage 1 (alignment) on 8x H100 via torchrun: projector only; LLM + SigLIP2 frozen."""
+    import os, subprocess
+    os.chdir("/root/moe-lab")
     out = f"/data/runs/{save_name}"
-    os.makedirs(out, exist_ok=True)
-    torch.save({"projector": vlm.mm_projector.state_dict(), "vision_dim": enc.hidden,
-                "backbone": BACKBONE, "steps": step}, f"{out}/projector.pt")
+    cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "vlm_stage1.py",
+           "--backbone", BACKBONE, "--json", "/llava/blip_laion_cc_sbu_558k.json",
+           "--images", "/llava/images", "--out", out,
+           "--max_steps", str(max_steps), "--micro", str(micro), "--lr", str(lr)]
+    print("RUN:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
     runs_vol.commit()
-    print(f"saved projector -> {out}/projector.pt  (final loss {last:.4f})", flush=True)
-    return {"final_loss": last, "steps": step}
+    return {"out": out, "steps": max_steps}
 
 
 @app.local_entrypoint()
-def main(action: str = "smoke", max_steps: int = 2000, micro: int = 24, lr: float = 1e-3):
+def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3):
     if action == "download":
         download.remote()
     elif action == "smoke":
