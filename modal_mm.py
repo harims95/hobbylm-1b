@@ -193,8 +193,16 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
     else:
         pre = tok.encode_ordinary(prompt) if prompt else []
 
+    def _banned_ngram(prev, n=3):
+        if len(prev) < n:
+            return []
+        seen = {}
+        for j in range(len(prev) - n + 1):
+            seen.setdefault(tuple(prev[j:j + n - 1]), []).append(prev[j + n - 1])
+        return seen.get(tuple(prev[-(n - 1):]), [])
+
     @torch.no_grad()
-    def gen(image):
+    def gen(image, rep_pen=1.3):
         feats = enc.encode([image])
         ids = torch.tensor([[IMAGE_TOKEN] + pre], device=dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -204,6 +212,13 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
                 logits, _ = vlm.llm(inputs_embeds=cur)
                 lg = logits[:, -1, :].float()
                 lg[:, GPT2_VALID:] = -float("inf")
+                # repetition penalty (CTRL-style) on already-generated tokens
+                if outs:
+                    u = torch.tensor(sorted(set(outs)), device=dev)
+                    v = lg[0, u]
+                    lg[0, u] = torch.where(v > 0, v / rep_pen, v * rep_pen)
+                for b in _banned_ngram(outs, 3):       # block repeating any 3-gram
+                    lg[0, b] = -float("inf")
                 t = int(lg.argmax(-1).item())
                 if t == EOT:
                     break
