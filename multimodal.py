@@ -25,7 +25,8 @@ IMAGE_TOKEN = 50257   # one sentinel per image; replaced by N projected patch fe
 AUDIO_TOKEN = 50258   # one sentinel per audio clip
 IM_START = 50259
 IM_END = 50260
-IGNORE_INDEX = -1     # target value for non-text (image/audio/pad) positions; matches model CE ignore_index
+VIDEO_TOKEN = 50261   # video = sampled frames through the SAME vision encoder + mm_projector (no new encoder)
+IGNORE_INDEX = -1     # target value for non-text positions; matches model CE ignore_index
 
 
 class Projector(nn.Module):
@@ -60,10 +61,12 @@ class MoEVLM(nn.Module):
 
     # ---- build the merged (B, L', d) embedding sequence by splicing modality features ----
     def build_inputs_embeds(self, input_ids: Tensor, image_features: Tensor | None = None,
-                            audio_features: Tensor | None = None, targets: Tensor | None = None):
+                            audio_features: Tensor | None = None, targets: Tensor | None = None,
+                            video_features: Tensor | None = None):
         B, L = input_ids.shape
         dev = input_ids.device
         img_proj = self.mm_projector(image_features) if image_features is not None else None  # (B,Ni,d)
+        vid_proj = self.mm_projector(video_features) if video_features is not None else None   # video reuses mm_projector
         aud_proj = (self.audio_projector(audio_features)
                     if (audio_features is not None and self.audio_projector is not None) else None)
 
@@ -76,6 +79,9 @@ class MoEVLM(nn.Module):
             if img_proj is not None:
                 for p in (ids == IMAGE_TOKEN).nonzero(as_tuple=True)[0]:
                     spots.append((int(p), img_proj[b]))
+            if vid_proj is not None:
+                for p in (ids == VIDEO_TOKEN).nonzero(as_tuple=True)[0]:
+                    spots.append((int(p), vid_proj[b]))
             if aud_proj is not None:
                 for p in (ids == AUDIO_TOKEN).nonzero(as_tuple=True)[0]:
                     spots.append((int(p), aud_proj[b]))
@@ -113,9 +119,10 @@ class MoEVLM(nn.Module):
         return inputs_embeds, new_targets
 
     def forward(self, input_ids: Tensor, image_features: Tensor | None = None,
-                audio_features: Tensor | None = None, targets: Tensor | None = None):
+                audio_features: Tensor | None = None, targets: Tensor | None = None,
+                video_features: Tensor | None = None):
         inputs_embeds, new_targets = self.build_inputs_embeds(
-            input_ids, image_features, audio_features, targets)
+            input_ids, image_features, audio_features, targets, video_features)
         return self.llm(inputs_embeds=inputs_embeds, targets=new_targets)
 
     # ---- param groups: freeze encoders (external), optionally freeze the LLM (stage 1) ----

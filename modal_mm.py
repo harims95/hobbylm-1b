@@ -391,6 +391,82 @@ def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, 
     print("\nCAPTION DONE", flush=True)
 
 
+@app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
+              timeout=30 * 60, secrets=[HF])
+def unified(stage2_run: str = "500M_vlm_stage2", audio_run: str = "500M_vlm_audio_stage1",
+            n: int = 4, max_new: int = 40):
+    """ONE model, three modalities: load stage-2 LLM + mm_projector (image & video) + audio_projector,
+    then describe an image, a video (frames of it), and an audio clip."""
+    import os, sys, io, json, zipfile, torch
+    os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
+    from PIL import Image
+    import tiktoken
+    from vision import SiglipVision
+    from video import SiglipVideo
+    from audio import ClapAudio
+    from multimodal import MoEVLM, IMAGE_TOKEN, VIDEO_TOKEN, AUDIO_TOKEN
+    from generate import load_model, GPT2_VALID, EOT
+    from vlm_audio_data import ClothoAudio
+
+    dev = torch.device("cuda")
+    vis = SiglipVision(device=dev); vid = SiglipVideo(vis); aud = ClapAudio(device=dev)
+    llm, cfg, _, _ = load_model(BACKBONE, dev)
+    vlm = MoEVLM(llm, vision_dim=vis.hidden, audio_dim=aud.hidden).to(dev)
+    s2 = torch.load(f"/data/runs/{stage2_run}/model.pt", map_location=dev, weights_only=False)
+    vlm.llm.load_state_dict(s2["model"]); vlm.mm_projector.load_state_dict(s2["projector"])
+    ap = torch.load(f"/data/runs/{audio_run}/audio_projector.pt", map_location=dev, weights_only=False)
+    vlm.audio_projector.load_state_dict(ap["audio_projector"])
+    vlm.eval()
+    print(f"UNIFIED: LLM+mm_projector from {stage2_run}, audio_projector from {audio_run}", flush=True)
+    tok = tiktoken.get_encoding("gpt2")
+
+    def _banned(prev, k=3):
+        if len(prev) < k:
+            return []
+        seen = {}
+        for j in range(len(prev) - k + 1):
+            seen.setdefault(tuple(prev[j:j + k - 1]), []).append(prev[j + k - 1])
+        return seen.get(tuple(prev[-(k - 1):]), [])
+
+    @torch.no_grad()
+    def gen(sentinel, **feat):
+        pre = tok.encode_ordinary("USER: Describe this in detail.\nASSISTANT:")
+        ids = torch.tensor([[sentinel] + pre], device=dev)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            cur, _ = vlm.build_inputs_embeds(ids, **feat)
+            outs = []
+            for _ in range(max_new):
+                lg = vlm.llm(inputs_embeds=cur)[0][:, -1, :].float()
+                lg[:, GPT2_VALID:] = -float("inf")
+                if outs:
+                    u = torch.tensor(sorted(set(outs)), device=dev); v = lg[0, u]
+                    lg[0, u] = torch.where(v > 0, v / 1.3, v * 1.3)
+                for b in _banned(outs):
+                    lg[0, b] = -float("inf")
+                t = int(lg.argmax(-1).item())
+                if t == EOT:
+                    break
+                outs.append(t)
+                cur = torch.cat([cur, vlm.llm.embed(torch.tensor([[t]], device=dev)).to(cur.dtype)], dim=1)
+        return tok.decode(outs).strip()
+
+    laion = json.load(open("/llava/blip_laion_cc_sbu_558k.json"))
+    imgzip = zipfile.ZipFile("/llava/images.zip")
+    clotho = ClothoAudio()
+    for k in range(n):
+        ex = laion[(k * 7919) % len(laion)]
+        img = Image.open(io.BytesIO(imgzip.read(ex["image"]))).convert("RGB")
+        ifeats = vis.encode([img])
+        vfeats = vid.encode_frames([img] * 4)                          # static 4-frame "video" of the image
+        wav, agt = clotho.raw((k * 619) % len(clotho))
+        afeats = aud.encode([wav])
+        print(f"\n=== sample {k} ===", flush=True)
+        print(f"[IMAGE]  PRED: {gen(IMAGE_TOKEN, image_features=ifeats)}", flush=True)
+        print(f"[VIDEO]  PRED: {gen(VIDEO_TOKEN, video_features=vfeats)}", flush=True)
+        print(f"[AUDIO GT: {str(agt)[:55]}]\n[AUDIO]  PRED: {gen(AUDIO_TOKEN, audio_features=afeats)}", flush=True)
+    print("\nUNIFIED DONE", flush=True)
+
+
 @app.local_entrypoint()
 def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, n: int = 8,
          stage2_run: str = ""):
@@ -407,6 +483,8 @@ def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: floa
                                   micro=(micro if micro != 32 else 16), lr=lr)
     elif action == "caption_audio":
         caption_audio.remote(n=n)
+    elif action == "unified":
+        unified.remote(n=(n if n != 8 else 4))
     elif action == "stage1":
         train_stage1.remote(max_steps=max_steps, micro=micro, lr=lr)
     elif action == "stage2":

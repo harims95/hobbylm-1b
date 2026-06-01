@@ -163,6 +163,23 @@ def test_sft_masking():
     print("    OK")
 
 
+def test_video_splice():
+    print("[9] video splice (reuses mm_projector at VIDEO_TOKEN)")
+    from multimodal import VIDEO_TOKEN
+    VIS, NV = 1152, 20
+    vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=VIS)
+    ids = torch.tensor([[VIDEO_TOKEN, 5, 6, 7]])
+    tgt = torch.tensor([[5, 6, 7, 50256]])
+    vid = torch.randn(1, NV, VIS)
+    embeds, _ = vlm.build_inputs_embeds(ids, video_features=vid, targets=tgt)
+    assert embeds.shape[1] == 4 - 1 + NV
+    loss, _ = vlm(ids, video_features=vid, targets=tgt)
+    loss.backward()
+    g = vlm.mm_projector.net[0].weight.grad           # video flows through the IMAGE projector
+    assert torch.isfinite(loss) and g is not None and torch.isfinite(g).all()
+    print(f"    merged len={embeds.shape[1]} (expect {4-1+NV})  loss={loss.item():.4f}  OK")
+
+
 def test_stage1_freeze():
     print("[5] stage-1 freeze: only projector trains")
     vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=1152)
@@ -182,5 +199,6 @@ if __name__ == "__main__":
     test_dtype_mismatch()
     test_target_alignment()
     test_sft_masking()
+    test_video_splice()
     test_stage1_freeze()
     print("\nALL VLM PLUMBING TESTS PASSED")
