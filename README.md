@@ -61,31 +61,36 @@ would need the `hobbylm` arch registered first.
 embeds `hobby-rs` along with the multimodal encoders, computer-use (Windows UI-Automation accessibility
 tree), and an MCP client for tool use. Point it at a GGUF and everything runs on your machine.
 
-## Training it — `train.py` + Modal
+## Training it — `training/` + Modal
 
 The training stack is plain PyTorch, run on [Modal](https://modal.com) serverless GPUs (1–8× H100):
 FineWeb in, checkpoints out, with the full ablation suite a flag away.
 
 ```bash
-python count_params.py --smoke                                   # local CPU sanity check
-python -m modal run modal_train.py --action train --preset 500M  # train on Modal H100s
-python -m modal run modal_train.py --action ablate --steps 3000  # run the architecture ablations
+python -m hobbylm.count_params --smoke                                    # local CPU sanity check
+python -m modal run training/modal_train.py --action train --preset 500M  # train on Modal H100s
+python -m modal run training/modal_train.py --action ablate --steps 3000  # run the architecture ablations
 ```
 
-Multimodal, tool-use, diffusion, and image-generation training live in `modal_mm.py`, `modal_tools.py`,
-`modal_dreamlite.py`, and the `dreamlite/` package.
+Multimodal, tool-use, diffusion, and image-generation training live in `training/modal_mm.py`,
+`training/modal_tools.py`, `training/modal_dreamlite.py`, and the `dreamlite/` package.
 
 ## Layout
 
 ```
-config.py model.py moe.py optim.py train.py   core MoE training
-modal_train.py modal_mm.py modal_tools.py     Modal training harnesses
-dreamlite/  modal_dreamlite.py                text-to-image diffusion model
-to_gguf.py  modal_hobbylm.py                  GGUF / safetensors export + HF release
-hobby-rs/                                     Rust CPU inference engine
-hobby-rs-cli/                                 standalone CLI build of the engine
-hobby-chat/                                   Tauri desktop app
-docs/                                         architecture notes + plans
+hobbylm/        core importable library: model.py, moe.py, config.py, optim.py,
+                multimodal/vision/audio/speech encoders, generate, tool + eval utils
+training/       train*.py + Modal harnesses (modal_train/mm/tools/dreamlite/hobbylm)
+export/         to_gguf.py, to_aproj.py, to_mmproj.py — GGUF / projector / safetensors export
+agents/         computer-use + UI agent loops
+eval/           tool-use and VLM eval harness runners
+tests/          smoke + integration tests
+docs/           architecture notes + plans
+assets/         small test fixtures (jfk.wav, test_dog.jpg)
+dreamlite/      text-to-image diffusion model package
+hobby-rs/       Rust CPU inference engine
+hobby-rs-cli/   standalone CLI build of the engine
+hobby-chat/     Tauri desktop app
 ```
 
 ## Honest status
