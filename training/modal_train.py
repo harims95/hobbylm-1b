@@ -12,6 +12,9 @@
   # an ablation (override model config fields):
   python -m modal run modal_train.py --action train --preset 130M --run-name softmax --overrides "gating=softmax"
 """
+from __future__ import annotations
+
+import os
 import subprocess
 import modal
 
@@ -26,6 +29,13 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.12.0", "numpy", "huggingface-hub", "tqdm", "tiktoken")
     .add_local_dir(".", "/root/moe-lab")   # mounted at runtime (code iteration without rebuild)
+)
+
+mix_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("numpy", "datasets", "huggingface-hub", "tqdm", "tiktoken", "zstandard")
+    .env({"HF_HUB_DISABLE_XET": "1", "HF_HOME": "/cache/hf"})
+    .add_local_dir(".", "/root/moe-lab")
 )
 
 # separate image for lm-evaluation-harness (heavy deps: transformers/datasets) so it doesn't
@@ -71,6 +81,73 @@ def download(chunks: int = 10, dataset: str = "10B"):
     print(f"data ready [{dataset}]: {chunks} train chunks (~{chunks*100}M tokens) + val in {ddir}", flush=True)
 
 
+@app.function(image=mix_image, cpu=2, memory=32768, volumes={"/data": vol, "/cache/hf": hf_cache},
+              timeout=86400, secrets=[modal.Secret.from_name("huggingface")])
+def build_mix(scale: float = 0.5, out: str = "/data/mix5B", phase: str = "both", seed: int = 1337):
+    """Build each source sequentially and commit the volume after every completed source."""
+    import os
+    import subprocess
+
+    os.chdir("/root/moe-lab")
+    os.makedirs(out, exist_ok=True)
+    sources = ["edu", "dclm", "code", "math", "anneal"]
+    completed = []
+    for source in sources:
+        marker = os.path.join(out, f".{source}.done")
+        if os.path.exists(marker):
+            print(f"SKIP {source}: completion marker already exists", flush=True)
+            completed.append(source)
+            continue
+        cmd = ["python", "prepare_mix10B.py", "--out", out, "--scale", str(scale), "--source", source]
+        print("RUN:", " ".join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
+        vol.commit()
+        completed.append(source)
+        print(f"COMMITTED {source}", flush=True)
+    return {"out": out, "scale": scale, "completed": completed}
+
+
+@app.function(image=mix_image, cpu=2, memory=8192, volumes={"/data": vol, "/cache/hf": hf_cache},
+              timeout=30 * 60, secrets=[modal.Secret.from_name("huggingface")])
+def inspect_stream_sample(dataset: str, config: str = "", split: str = "train", streaming: bool = True):
+    """Fetch one sample and print its schema for quick dataset debugging."""
+    from datasets import load_dataset
+
+    cfg = config or None
+    ds = load_dataset(dataset, cfg, split=split, streaming=streaming)
+    rows = []
+    it = iter(ds) if streaming else None
+    print(f"dataset={dataset} config={cfg} split={split} streaming={streaming}", flush=True)
+    for idx in range(3):
+        row = next(it) if streaming else ds[idx]
+        preview = {}
+        print(f"sample={idx}", flush=True)
+        print(f"keys={list(row.keys())}", flush=True)
+        for key, value in row.items():
+            text = value if isinstance(value, str) else repr(value)
+            snippet = text[:200]
+            preview[key] = snippet
+            print(f"[{key}] {snippet}", flush=True)
+        rows.append({"keys": list(row.keys()), "preview": preview})
+    return {"dataset": dataset, "config": cfg, "split": split, "streaming": streaming, "samples": rows}
+
+
+@app.function(image=mix_image, cpu=2, memory=32768, volumes={"/data": vol, "/cache/hf": hf_cache},
+              timeout=86400, secrets=[modal.Secret.from_name("huggingface")])
+def build_mix_source(source: str, scale: float = 0.5, out: str = "/data/mix5B"):
+    """Rebuild exactly one source into the mix volume."""
+    import os
+    import subprocess
+
+    os.chdir("/root/moe-lab")
+    os.makedirs(out, exist_ok=True)
+    cmd = ["python", "prepare_mix10B.py", "--out", out, "--scale", str(scale), "--source", source]
+    print("RUN:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    vol.commit()
+    return {"out": out, "scale": scale, "source": source}
+
+
 # ---- throughput-optimization presets: (model-config --set overrides, orthogonalizer) ----
 # SHIPPING: all_safe (fused_ce + polar). fused_ce is the win: +6% step time, -21% peak memory,
 # enables ~2x larger batch, numerics-identical.
@@ -88,8 +165,9 @@ OPT_PRESETS: dict[str, tuple[list, str]] = {
 
 
 def _train_body(preset, steps, run_name, overrides, gpus, micro, seq_len, batch_tokens,
-                save_every=0, data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
-    import os
+                save_every=0, data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin",
+                val_pattern="fineweb_val_*.bin", opts="baseline", init_from="",
+                resume="", lr_mult=1.0, schedule_max_steps=0, shuffle_shards=False):
     os.chdir("/root/moe-lab")
     opt_sets, orthog = OPT_PRESETS.get(opts, ([], "ns5"))
     user_sets = overrides.split(",") if overrides else []
@@ -98,13 +176,20 @@ def _train_body(preset, steps, run_name, overrides, gpus, micro, seq_len, batch_
     extra = []
     if init_from:
         extra += ["--init_from", init_from]
+    if resume:
+        extra += ["--resume", resume]
     if lr_mult != 1.0:
         extra += ["--lr_mult", str(lr_mult)]
+    if schedule_max_steps:
+        extra += ["--schedule_max_steps", str(schedule_max_steps)]
+    if shuffle_shards:
+        extra += ["--shuffle_shards"]
     cmd = [
         "torchrun", "--standalone", f"--nproc_per_node={gpus}", "training/train.py",
         "--preset", preset, "--run_name", run_name, "--data_dir", data_dir,
         "--out_dir", "/data/runs", "--max_steps", str(steps), "--micro_batch_seqs", str(micro),
         "--seq_len", str(seq_len), "--batch_tokens", str(batch_tokens),
+        "--train_pattern", train_pattern, "--val_pattern", val_pattern,
         "--orthogonalizer", orthog, "--save_every", str(save_every), *extra, *over,
     ]
     print("RUN:", " ".join(cmd), flush=True)
@@ -114,6 +199,83 @@ def _train_body(preset, steps, run_name, overrides, gpus, micro, seq_len, batch_
     rp = f"/data/runs/{run_name}/result.json"
     res = json.load(open(rp)) if os.path.exists(rp) else {}
     return {"run": run_name, **res}
+
+
+@app.function(image=image, cpu=4, memory=8192, volumes={"/data": vol},
+              timeout=60 * 60)
+def verify_mix(out: str = "/data/tiny", pattern: str = "mix_train_*.bin", sample_tokens: int = 200):
+    """Load shards with the repo reader and decode a short sample for eyeballing."""
+    import glob
+    import sys
+
+    import tiktoken
+
+    os.chdir("/root/moe-lab")
+    sys.path.insert(0, "/root/moe-lab")
+    from hobbylm.data import load_shard
+
+    enc = tiktoken.get_encoding("gpt2")
+    paths = sorted(glob.glob(os.path.join(out, pattern)))
+    if not paths:
+        raise RuntimeError(f"no shards found in {out} for pattern {pattern}")
+
+    summaries = []
+    for path in paths:
+        toks = load_shard(path)
+        if toks.numel() == 0:
+            raise RuntimeError(f"empty shard: {path}")
+        sample = enc.decode([int(t) for t in toks[:sample_tokens].tolist() if int(t) < enc.n_vocab])
+        summaries.append({
+            "path": path,
+            "tokens": int(toks.numel()),
+            "sample": sample,
+        })
+        print(f"[verify_mix] {os.path.basename(path)} tokens={toks.numel():,}", flush=True)
+        print(sample[:600], flush=True)
+        print("-" * 60, flush=True)
+
+    return {
+        "out": out,
+        "pattern": pattern,
+        "count": len(summaries),
+        "tokens": sum(s["tokens"] for s in summaries),
+        "samples": summaries,
+    }
+
+
+@app.function(image=image, cpu=2, memory=4096, volumes={"/data": vol},
+              timeout=30 * 60)
+def verify_mix5b_training_data(out: str = "/data/mix5B", sample_tokens: int = 200):
+    import glob
+    import os
+    import sys
+
+    import tiktoken
+
+    os.chdir("/root/moe-lab")
+    sys.path.insert(0, "/root/moe-lab")
+    from hobbylm.data import load_shard
+
+    enc = tiktoken.get_encoding("gpt2")
+    checks = {
+        "edu": "edu_*.bin",
+        "code": "code_*.bin",
+        "math": "math_*.bin",
+        "val": "/data/fineweb10B/fineweb_val_*.bin",
+    }
+    out_data = {}
+    for key, pattern in checks.items():
+        paths = sorted(glob.glob(pattern if pattern.startswith("/data/") else os.path.join(out, pattern)))
+        if not paths:
+            raise RuntimeError(f"no shards found for {key}: {pattern}")
+        path = paths[0]
+        toks = load_shard(path)
+        sample = enc.decode([int(t) for t in toks[:sample_tokens].tolist() if int(t) < enc.n_vocab])
+        out_data[key] = {"path": path, "tokens": int(toks.numel()), "sample": sample}
+        print(f"[verify_mix5b_training_data] {key}: {os.path.basename(path)} tokens={toks.numel():,}", flush=True)
+        print(sample[:600], flush=True)
+        print("-" * 60, flush=True)
+    return out_data
 
 
 @app.function(gpu="H100", timeout=20 * 60)
@@ -312,23 +474,52 @@ def specdecode(draft_run: str = "130M_10B", target_run: str = "500M_40B", K: int
 
 @app.function(gpu="H100", volumes={"/data": vol}, timeout=24 * 60 * 60)
 def train_1(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
-            data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
+            data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin",
+            opts="baseline", init_from="", resume="", lr_mult=1.0, schedule_max_steps=0,
+            shuffle_shards=False):
     return _train_body(preset, steps, run_name, overrides, 1, micro, seq_len, batch_tokens,
-                       save_every, data_dir, opts, init_from, lr_mult)
+                       save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                       schedule_max_steps, shuffle_shards)
+
+
+@app.function(gpu="H100:2", volumes={"/data": vol}, timeout=24 * 60 * 60)
+def train_2(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
+            data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin",
+            opts="baseline", init_from="", resume="", lr_mult=1.0, schedule_max_steps=0,
+            shuffle_shards=False):
+    return _train_body(preset, steps, run_name, overrides, 2, micro, seq_len, batch_tokens,
+                       save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                       schedule_max_steps, shuffle_shards)
+
+
+@app.function(gpu="H100:4", volumes={"/data": vol}, timeout=24 * 60 * 60)
+def train_4(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
+            data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin",
+            opts="baseline", init_from="", resume="", lr_mult=1.0, schedule_max_steps=0,
+            shuffle_shards=False):
+    return _train_body(preset, steps, run_name, overrides, 4, micro, seq_len, batch_tokens,
+                       save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                       schedule_max_steps, shuffle_shards)
 
 
 @app.function(gpu="H100:8", volumes={"/data": vol}, timeout=24 * 60 * 60)
 def train_8(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
-            data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
+            data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin",
+            opts="baseline", init_from="", resume="", lr_mult=1.0, schedule_max_steps=0,
+            shuffle_shards=False):
     return _train_body(preset, steps, run_name, overrides, 8, micro, seq_len, batch_tokens,
-                       save_every, data_dir, opts, init_from, lr_mult)
+                       save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                       schedule_max_steps, shuffle_shards)
 
 
 @app.function(gpu="B200:8", volumes={"/data": vol}, timeout=24 * 60 * 60)
 def train_8b200(preset, steps, run_name, overrides, micro, seq_len, batch_tokens, save_every=0,
-                data_dir=DATA_DIR, opts="baseline", init_from="", lr_mult=1.0):
+                data_dir=DATA_DIR, train_pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin",
+                opts="baseline", init_from="", resume="", lr_mult=1.0, schedule_max_steps=0,
+                shuffle_shards=False):
     return _train_body(preset, steps, run_name, overrides, 8, micro, seq_len, batch_tokens,
-                       save_every, data_dir, opts, init_from, lr_mult)
+                       save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                       schedule_max_steps, shuffle_shards)
 
 
 # default benchmark suite for small models (all loglikelihood / multiple-choice, GPT-2/Pythia-style)
@@ -474,6 +665,39 @@ def lm_eval_run(run_name: str, ckpt: str = "model.pt", tasks: str = EVAL_TASKS,
     return summary
 
 
+@app.function(gpu="H100:2", volumes={"/data": vol}, timeout=24 * 60 * 60)
+def train_recipe_130m_mix5b(run_name: str = "130M_mix5B",
+                            data_dir: str = "/data/mix5B",
+                            val_pattern: str = "/data/fineweb10B/fineweb_val_*.bin",
+                            main_steps: int = 4050,
+                            total_steps: int = 4770,
+                            batch_tokens: int = 1048576,
+                            micro: int = 16,
+                            seq_len: int = 1024,
+                            opts: str = "fused_ce",
+                            save_every: int = 1000,
+                            anneal_pattern: str = "anneal_*.bin",
+                            main_pattern: str = "edu_*.bin,dclm_*.bin,code_*.bin,math_*.bin",
+                            lr_mult: float = 1.0,
+                            shuffle_shards: bool = True):
+    """Run the 130M 2xH100 recipe as one detached job: main mix then anneal resume."""
+    if total_steps <= main_steps:
+        raise RuntimeError(f"total_steps={total_steps} must be greater than main_steps={main_steps}")
+
+    boundary_ckpt = f"/data/runs/{run_name}/ckpt_{main_steps}.pt"
+    stage_a = _train_body("130M", main_steps, run_name, "", 2, micro, seq_len, batch_tokens,
+                          save_every=main_steps, data_dir=data_dir, train_pattern=main_pattern,
+                          val_pattern=val_pattern, opts=opts, lr_mult=lr_mult,
+                          shuffle_shards=shuffle_shards)
+    if not os.path.exists(boundary_ckpt):
+        raise RuntimeError(f"expected stage-A checkpoint missing: {boundary_ckpt}")
+    stage_b = _train_body("130M", total_steps, run_name, "", 2, micro, seq_len, batch_tokens,
+                          save_every=save_every, data_dir=data_dir, train_pattern=anneal_pattern,
+                          val_pattern=val_pattern, opts=opts, resume=boundary_ckpt, lr_mult=lr_mult,
+                          shuffle_shards=shuffle_shards)
+    return {"run": run_name, "stage_a": stage_a, "stage_b": stage_b, "boundary_ckpt": boundary_ckpt}
+
+
 @app.function(image=eval_image, timeout=2 * 60 * 60, volumes={"/cache/hf": hf_cache},
               secrets=[modal.Secret.from_name("huggingface")])
 def prep_data(tasks: str = "mmlu"):
@@ -597,17 +821,48 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
          run_name: str = "baseline", overrides: str = "", gpus: int = 1,
          chunks: int = 10, micro: int = 16, seq_len: int = 1024,
          batch_tokens: int = 262144, save_every: int = 0, data: str = "10B",
-         opts: str = "baseline", tasks: str = "", limit: int = 0, fewshot: int = 0,
-         init_from: str = "", lr_mult: float = 1.0, gpu_type: str = "H100"):
-    data_dir = DATASETS[data][1]
+         data_dir: str = "", train_pattern: str = "fineweb_train_*.bin",
+         val_pattern: str = "fineweb_val_*.bin", opts: str = "baseline", tasks: str = "",
+         limit: int = 0, fewshot: int = 0, init_from: str = "", resume: str = "",
+         lr_mult: float = 1.0, gpu_type: str = "H100", mix_scale: float = 0.5,
+         mix_out: str = "/data/mix5B", phase: str = "both", seed: int = 1337,
+         shuffle_shards: int = 0, schedule_max_steps: int = 0,
+         ckpt: str = "model.pt"):
+    data_dir = data_dir or DATASETS[data][1]
     if action == "prep_data":
         prep_data.remote(tasks or "mmlu")
+        return
+    if action == "build_mix":
+        build_mix.remote(mix_scale, mix_out, phase, seed)
+        return
+    if action == "smoke_mix":
+        build_mix.remote(0.001, "/data/tiny", "both", 1337)
+        verify_mix.remote("/data/tiny", "mix_train_*.bin")
+        verify_mix.remote("/data/tiny", "anneal_train_*.bin")
+        return
+    if action == "verify_mix":
+        verify_mix.remote(mix_out, tasks or "mix_train_*.bin")
+        return
+    if action == "train_recipe_130m_mix5b":
+        train_recipe_130m_mix5b.remote(
+            run_name=run_name if run_name != "baseline" else "130M_mix5B",
+            data_dir=(mix_out if mix_out else "/data/mix5B"),
+            val_pattern=val_pattern,
+            main_steps=(steps if steps != 4000 else 4050),
+            total_steps=(limit if limit != 0 else 4770),
+            batch_tokens=batch_tokens if batch_tokens != 262144 else 1048576,
+            micro=micro,
+            seq_len=seq_len,
+            opts=opts if opts != "baseline" else "fused_ce",
+            save_every=save_every if save_every else 1000,
+            shuffle_shards=bool(shuffle_shards),
+        )
         return
     if action == "lmeval":
         # EleutherAI lm-evaluation-harness on trained checkpoint(s). run_name="both" -> 130M + 500M.
         targets = ["130M_10B", "500M_40B"] if run_name in ("both", "baseline", "") else [run_name]
         tk = tasks or EVAL_TASKS
-        args_t = [(t, "model.pt", tk, limit, 32, fewshot) for t in targets]
+        args_t = [(t, ckpt, tk, limit, 32, fewshot) for t in targets]
         print(f"lm-eval on {targets} | tasks={tk} | {fewshot}-shot | limit={limit or 'full'}", flush=True)
         summaries = {t: s for t, s in zip(targets, lm_eval_run.starmap(args_t))}
         all_tasks = sorted({k for s in summaries.values() for k in s})
@@ -667,11 +922,16 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
     elif action == "train":
         if gpus == 8:
             fn = train_8b200 if gpu_type.upper() == "B200" else train_8
+        elif gpus == 4:
+            fn = train_4
+        elif gpus == 2:
+            fn = train_2
         else:
             fn = train_1
         print(f"training on {gpus}x{gpu_type.upper() if gpus == 8 else 'H100'}", flush=True)
         fn.remote(preset, steps, run_name, overrides, micro, seq_len, batch_tokens,
-                  save_every, data_dir, opts, init_from, lr_mult)
+                  save_every, data_dir, train_pattern, val_pattern, opts, init_from, resume, lr_mult,
+                  schedule_max_steps, bool(shuffle_shards))
     elif action == "gpu_bench":
         kv = dict(p.split("=", 1) for p in overrides.split(",") if "=" in p) if overrides else {}
         r = gpu_bench.remote(diff_run=(run_name if run_name not in ("baseline", "") else "500M_diff_20b"),
@@ -719,7 +979,8 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
         # quality ablation: short real-data training at `preset` for each optimization variant.
         variants = ["baseline", "fused_ce", "polar", "all_safe"]  # fp8 dropped: no speedup + zero-grad (see OPT_PRESETS)
         st = steps if steps != 4000 else 800
-        args_t = [(preset, st, f"opt_{v}", "", micro, seq_len, batch_tokens, 0, data_dir, v)
+        args_t = [(preset, st, f"opt_{v}", "", micro, seq_len, batch_tokens, 0, data_dir,
+                   train_pattern, val_pattern, v)
                   for v in variants]
         print(f"opt-quality ablation at {preset}, {st} steps each (parallel H100s)...", flush=True)
         done = []
@@ -732,7 +993,8 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
             print(f"{r.get('run'):>14} | {r.get('final_val_loss')}", flush=True)
     elif action == "ablate":
         # run all ablations in parallel via starmap (keeps the app alive until all finish)
-        arg_tuples = [(preset, steps, f"ab_{name}", ov, micro, seq_len, batch_tokens)
+        arg_tuples = [(preset, steps, f"ab_{name}", ov, micro, seq_len, batch_tokens,
+                       0, data_dir, train_pattern, val_pattern)
                       for name, ov in ABLATIONS.items()]
         print(f"launching {len(arg_tuples)} ablations at {preset}, {steps} steps each (parallel H100s)...",
               flush=True)
@@ -751,5 +1013,6 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
     elif action == "specdecode":
         specdecode.remote("130M_10B", "500M_40B", 4, overrides)
     else:
-        raise SystemExit(f"unknown action {action!r} (use download|smoke|train|speedtest|ablate_opts|"
-                         "ablate|results|generate|specdecode|lmeval|lmeval_hf)")
+        raise SystemExit(f"unknown action {action!r} (use download|build_mix|smoke_mix|verify_mix|"
+                         "smoke|train|train_recipe_130m_mix5b|speedtest|ablate_opts|ablate|"
+                         "results|generate|specdecode|lmeval|lmeval_hf)")

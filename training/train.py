@@ -31,13 +31,14 @@ from hobbylm.optim import build_optimizers
 from hobbylm.diffusion import forward_mask
 
 
-def lr_mult(step: int, tc: TrainConfig) -> float:
+def lr_mult(step: int, tc: TrainConfig, schedule_max_steps: int | None = None) -> float:
+    max_steps = schedule_max_steps or tc.max_steps
     if step < tc.warmup_steps:
         return (step + 1) / tc.warmup_steps
-    cd_start = int(tc.max_steps * (1 - tc.cooldown_frac))
+    cd_start = int(max_steps * (1 - tc.cooldown_frac))
     if step < cd_start:
         return 1.0
-    t = (step - cd_start) / max(1, tc.max_steps - cd_start)
+    t = (step - cd_start) / max(1, max_steps - cd_start)
     return 1.0 + t * (tc.final_lr_frac - 1.0)
 
 
@@ -54,15 +55,29 @@ def parse_overrides(pairs: list[str]) -> dict:
     return out
 
 
+def resolve_pattern(data_dir: str, pattern: str) -> str:
+    parts = []
+    for piece in (p.strip() for p in pattern.split(",") if p.strip()):
+        path = Path(piece)
+        parts.append(str(path if path.is_absolute() else Path(data_dir) / piece))
+    return ",".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="130M")
     ap.add_argument("--run_name", default="baseline")
     ap.add_argument("--data_dir", default="data/fineweb10B")
+    ap.add_argument("--train_pattern", default="fineweb_train_*.bin")
+    ap.add_argument("--val_pattern", default="fineweb_val_*.bin")
     ap.add_argument("--max_steps", type=int, default=4000)
+    ap.add_argument("--schedule_max_steps", type=int, default=0,
+                    help="step horizon for LR schedule and bias freeze (defaults to max_steps)")
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--batch_tokens", type=int, default=256 * 1024)
     ap.add_argument("--micro_batch_seqs", type=int, default=16)
+    ap.add_argument("--shuffle_shards", action="store_true",
+                    help="shuffle shard order each pass through the dataset (deterministic by seed)")
     ap.add_argument("--val_every", type=int, default=250)
     ap.add_argument("--out_dir", default="runs")
     ap.add_argument("--save_every", type=int, default=0, help="save a checkpoint every N steps (0=only final)")
@@ -70,9 +85,12 @@ def main():
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"],
                     help="Muon orthogonalizer: ns5 (Newton-Schulz) or polar (Polar Express)")
     ap.add_argument("--init_from", default="", help="checkpoint .pt to resume model weights from (continued pretrain)")
+    ap.add_argument("--resume", default="", help="checkpoint .pt to resume full training state from")
     ap.add_argument("--lr_mult", type=float, default=1.0, help="multiply base LRs (use <1 for finetune/ctx-extension)")
     ap.add_argument("--set", nargs="*", default=[], help="model config overrides key=value")
     args = ap.parse_args()
+    if args.init_from and args.resume:
+        raise SystemExit("use only one of --init_from or --resume")
 
     # ---- DDP setup ----
     ddp = "RANK" in os.environ
@@ -92,7 +110,8 @@ def main():
         if master:
             print(*a, flush=True)
 
-    tc = TrainConfig(seq_len=args.seq_len, batch_tokens=args.batch_tokens,
+    tc = TrainConfig(data_dir=args.data_dir, train_pattern=args.train_pattern, val_pattern=args.val_pattern,
+                     seq_len=args.seq_len, batch_tokens=args.batch_tokens,
                      micro_batch_seqs=args.micro_batch_seqs, max_steps=args.max_steps,
                      val_every=args.val_every, run_name=args.run_name,
                      out_dir=args.out_dir, compile=not args.no_compile,
@@ -116,12 +135,6 @@ def main():
         cfg.expert_backend = "bmm"   # grouped_mm needs CUDA bf16
 
     model = MoETransformer(cfg).to(device)   # fp32 master weights; bf16 via autocast
-    if args.init_from:
-        ck = torch.load(args.init_from, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
-        log(f"resumed weights from {args.init_from} "
-            f"(prev step={ck.get('step')}, val={ck.get('val_loss')}; "
-            f"missing={len(missing)} unexpected={len(unexpected)})")
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
            if device.type == "cuda" and tc.bf16 else nullcontext())
     pc = count_params(model)
@@ -136,28 +149,79 @@ def main():
 
     muon, adamw, (nm, na) = build_optimizers(raw_model, tc)
     log(f"optimizers: Muon over {nm} tensors, AdamW over {na} tensors")
+    start_step = 0
+    resume_path = args.resume or args.init_from
+    if resume_path:
+        ck = torch.load(resume_path, map_location=device, weights_only=False)
+        missing, unexpected = raw_model.load_state_dict(ck["model"], strict=False)
+        if args.resume:
+            if "muon" in ck:
+                muon.load_state_dict(ck["muon"])
+            if "adamw" in ck:
+                adamw.load_state_dict(ck["adamw"])
+            start_step = int(ck.get("step", 0))
+            log(f"resumed training state from {resume_path} "
+                f"(step={start_step}, val={ck.get('val_loss')}; "
+                f"missing={len(missing)} unexpected={len(unexpected)})")
+        else:
+            log(f"resumed weights from {resume_path} "
+                f"(prev step={ck.get('step')}, val={ck.get('val_loss')}; "
+                f"missing={len(missing)} unexpected={len(unexpected)})")
 
     # ---- data ----
     B, S = tc.micro_batch_seqs, tc.seq_len
     tokens_per_micro = B * S * world
     accum = max(1, tc.batch_tokens // tokens_per_micro)
-    train_gen = data_generator(str(Path(args.data_dir) / "fineweb_train_*.bin"), B, S, device,
-                               rank, world, to_device=False)
+    train_pattern = resolve_pattern(tc.data_dir, tc.train_pattern)
+    schedule_max_steps = args.schedule_max_steps or tc.max_steps
+    train_gen = data_generator(train_pattern, B, S, device,
+                               rank, world, to_device=False,
+                               shuffle_shards=args.shuffle_shards, seed=tc.seed)
     train_prefetch = CUDAPrefetcher(train_gen, device)   # overlaps H2D copy with compute
-    val_pattern = str(Path(args.data_dir) / "fineweb_val_*.bin")
+    val_pattern = resolve_pattern(tc.data_dir, tc.val_pattern)
     log(f"batch_tokens={tc.batch_tokens} micro=({B}x{S})x{world} accum={accum} "
         f"lr_scale={lr_scale:.2f} muon_lr={tc.muon_lr:.4f} adam_lr={tc.adam_lr:.2e}")
+    log(f"train_pattern={train_pattern} val_pattern={val_pattern}")
+    log(f"schedule_max_steps={schedule_max_steps}")
 
     out_dir = Path(tc.out_dir) / tc.run_name
     if master:
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "config.json").write_text(json.dumps({**cfg.to_dict(), "preset": args.preset}, indent=2))
+        (out_dir / "config.json").write_text(json.dumps({
+            **cfg.to_dict(),
+            "preset": args.preset,
+            "train": {
+                "data_dir": tc.data_dir,
+                "train_pattern": tc.train_pattern,
+                "val_pattern": tc.val_pattern,
+                "max_steps": tc.max_steps,
+                "schedule_max_steps": schedule_max_steps,
+                "batch_tokens": tc.batch_tokens,
+                "micro_batch_seqs": tc.micro_batch_seqs,
+                "shuffle_shards": args.shuffle_shards,
+                "seed": tc.seed,
+            },
+        }, indent=2))
 
     def save_ckpt(fname, **extra):
         if not master:
             return
         torch.save({"model": raw_model.state_dict(),
-                    "config": {**cfg.to_dict(), "preset": args.preset}, **extra}, out_dir / fname)
+                    "muon": muon.state_dict(),
+                    "adamw": adamw.state_dict(),
+                    "config": {**cfg.to_dict(), "preset": args.preset},
+                    "train": {
+                        "data_dir": tc.data_dir,
+                        "train_pattern": tc.train_pattern,
+                        "val_pattern": tc.val_pattern,
+                        "max_steps": tc.max_steps,
+                        "schedule_max_steps": schedule_max_steps,
+                        "batch_tokens": tc.batch_tokens,
+                        "micro_batch_seqs": tc.micro_batch_seqs,
+                        "shuffle_shards": args.shuffle_shards,
+                        "seed": tc.seed,
+                    },
+                    **extra}, out_dir / fname)
         log(f"saved checkpoint -> {out_dir / fname}")
 
     def model_loss(m, x, y):
@@ -187,15 +251,21 @@ def main():
     # ---- train ----
     model.train()
     t0 = time.time()
-    for step in range(tc.max_steps):
+    bias_freeze_step = int(schedule_max_steps * tc.bias_anneal_frac)
+    if start_step >= bias_freeze_step:
+        raw_model.set_bias_update_rate(0.0)
+        log(f"resume step {start_step}: aux-free expert bias already frozen")
+    if start_step >= tc.max_steps:
+        raise SystemExit(f"resume step {start_step} is already at/after max_steps {tc.max_steps}")
+    for step in range(start_step, tc.max_steps):
         # lr schedule
-        m = lr_mult(step, tc)
+        m = lr_mult(step, tc, schedule_max_steps)
         for g in muon.param_groups:
             g["lr"] = tc.muon_lr * m
         for g in adamw.param_groups:
             g["lr"] = tc.adam_lr * m
         # bias anneal
-        if step == int(tc.max_steps * tc.bias_anneal_frac):
+        if step == bias_freeze_step:
             raw_model.set_bias_update_rate(0.0)
             log(f"step {step}: froze aux-free expert bias")
 
@@ -218,7 +288,7 @@ def main():
             raw_model.sync_expert_bias()   # keep aux-free bias buffers identical across ranks
 
         if step % tc.log_every == 0:
-            dt = (time.time() - t0) / (step + 1)
+            dt = (time.time() - t0) / (step - start_step + 1)
             log(f"step {step:5d} | loss {loss_accum.item():.4f} | lr {tc.muon_lr*m:.4f} | {dt*1000:.0f}ms/step")
         if tc.val_every and (step + 1) % tc.val_every == 0:
             vl = evaluate()

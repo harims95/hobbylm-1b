@@ -6,6 +6,7 @@ Yields (inputs, targets) of shape (B, S), next-token aligned per row. Shards by 
 from __future__ import annotations
 
 import glob
+import random
 import torch
 
 
@@ -22,16 +23,41 @@ def load_shard(path: str) -> torch.Tensor:
     return tokens
 
 
+def expand_patterns(patterns: str) -> list[str]:
+    files = []
+    seen = set()
+    for pattern in (p.strip() for p in patterns.split(",") if p.strip()):
+        for fp in sorted(glob.glob(pattern)):
+            if fp not in seen:
+                seen.add(fp)
+                files.append(fp)
+    return files
+
+
+def shard_order(patterns: str, shuffle_shards: bool = False, seed: int = 1337, cycle: int = 0) -> list[str]:
+    files = expand_patterns(patterns)
+    assert files, f"no data files match {patterns}"
+    if not shuffle_shards or len(files) <= 1:
+        return files
+
+    rng = random.Random(seed + cycle)
+    mixed = list(files)
+    rng.shuffle(mixed)
+    return mixed
+
+
 def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: int = 1,
-                   to_device: bool = True):
+                   to_device: bool = True, shuffle_shards: bool = False, seed: int = 1337):
     """Yields (x, y) of shape (B, S). If to_device is False, yields pinned CPU long tensors
     (for an async prefetcher to copy H2D while the GPU computes)."""
-    files = sorted(glob.glob(pattern))
+    files = expand_patterns(pattern)
     assert files, f"no data files match {pattern}"
     block = B * S
     pin = (not to_device) and torch.cuda.is_available()
+    cycle = 0
     while True:
-        for fp in files:
+        order = shard_order(pattern, shuffle_shards=shuffle_shards, seed=seed, cycle=cycle)
+        for fp in order:
             toks = load_shard(fp)
             n_blocks = (len(toks) - 1) // block
             # interleave blocks across ranks so each rank sees distinct data
@@ -46,6 +72,7 @@ def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: i
                 x = buf[:-1].view(B, S)
                 y = buf[1:].view(B, S)
                 yield x, y
+        cycle += 1
 
 
 class CUDAPrefetcher:
@@ -80,7 +107,7 @@ class CUDAPrefetcher:
 
 def count_tokens(pattern: str) -> int:
     total = 0
-    for fp in sorted(glob.glob(pattern)):
+    for fp in expand_patterns(pattern):
         header = torch.from_file(str(fp), False, 256, dtype=torch.int32)
         total += int(header[2].item())
     return total
