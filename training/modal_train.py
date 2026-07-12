@@ -152,16 +152,25 @@ def build_mix_source(source: str, scale: float = 0.5, out: str = "/data/mix5B"):
               timeout=86400, secrets=[modal.Secret.from_name("huggingface")])
 def build_100b_source(source: str, out: str = "/data/mix100B",
                       repo_id: str = "harims95/hobbylm-mix100b-gpt2"):
-    """Build one non-edu Phase 1 source and upload each completed shard to HF."""
+    """Build one non-edu Phase 1 source, commit it, then batch-upload local shards to HF."""
     import os
     import subprocess
 
     os.chdir("/root/moe-lab")
     os.makedirs(out, exist_ok=True)
-    cmd = ["python", "prepare_mix100B.py", "--out", out, "--source", source, "--repo-id", repo_id]
-    print("RUN:", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    build_cmd = [
+        "python", "prepare_mix100B.py", "--out", out, "--source", source,
+        "--repo-id", repo_id, "--skip-upload",
+    ]
+    print("RUN:", " ".join(build_cmd), flush=True)
+    subprocess.run(build_cmd, check=True)
     vol.commit()
+    print(f"COMMITTED {source} shards to Modal volume before HF upload", flush=True)
+
+    upload_cmd = ["python", "prepare_mix100B.py", "--out", out, "--source", source,
+                  "--repo-id", repo_id, "--upload-only"]
+    print("RUN:", " ".join(upload_cmd), flush=True)
+    subprocess.run(upload_cmd, check=True)
     return {"out": out, "source": source, "repo_id": repo_id}
 
 

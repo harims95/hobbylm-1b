@@ -7,13 +7,14 @@ FineWeb-Edu comes from byte-verified Karpathy shards. This script builds only:
   math_*.bin   -> 10B tokens
   anneal_*.bin -> 5B tokens
 
-Every flushed shard is uploaded to harims95/hobbylm-mix100b-gpt2 immediately.
+Builds resume from existing local/HF shards and upload each completed source in one batch.
 """
 from __future__ import annotations
 
 import argparse
 import math
 import os
+import re
 
 import numpy as np
 import tiktoken
@@ -61,17 +62,46 @@ def tokenize_batch(texts: list[str]) -> list[np.ndarray]:
     return out
 
 
+def prefix_files(out_dir: str, prefix: str) -> list[str]:
+    if not os.path.isdir(out_dir):
+        return []
+    pat = re.compile(rf"^{re.escape(prefix)}_(\d{{6}})\.bin$")
+    return sorted(name for name in os.listdir(out_dir) if pat.match(name))
+
+
+def local_prefix_stats(out_dir: str, prefix: str) -> tuple[int, int]:
+    total = 0
+    next_idx = 1
+    for name in prefix_files(out_dir, prefix):
+        path = os.path.join(out_dir, name)
+        header = np.fromfile(path, dtype=np.int32, count=256)
+        if len(header) != 256 or int(header[0]) != MAGIC or int(header[1]) != VERSION:
+            raise RuntimeError(f"bad shard header: {path}")
+        total += int(header[2])
+        next_idx = max(next_idx, int(name.split("_")[-1].split(".")[0]) + 1)
+    return total, next_idx
+
+
+def remote_prefix_stats(repo_id: str, prefix: str) -> tuple[int, int]:
+    api = HfApi(token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    pat = re.compile(rf"^{re.escape(prefix)}_(\d{{6}})\.bin$")
+    files = sorted(f for f in api.list_repo_files(repo_id=repo_id, repo_type="dataset") if pat.match(f))
+    if not files:
+        return 0, 1
+    max_idx = max(int(pat.match(f).group(1)) for f in files)
+    return len(files) * SHARD_TOKENS, max_idx + 1
+
+
 class ShardWriter:
-    def __init__(self, out_dir: str, prefix: str, repo_id: str, shard_tokens: int = SHARD_TOKENS):
+    def __init__(self, out_dir: str, prefix: str, shard_idx_start: int,
+                 shard_tokens: int = SHARD_TOKENS):
         self.out_dir = out_dir
         self.prefix = prefix
-        self.repo_id = repo_id
         self.shard_tokens = shard_tokens
         self.buf = np.empty(shard_tokens, dtype=np.uint16)
         self.n = 0
-        self.shard_idx = 1
+        self.shard_idx = shard_idx_start
         self.total = 0
-        self.api = HfApi(token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
         os.makedirs(out_dir, exist_ok=True)
 
     def add(self, toks: np.ndarray):
@@ -96,13 +126,6 @@ class ShardWriter:
             f.write(self.buf[:self.n].tobytes())
         self.total += self.n
         print(f"WROTE {path} ({self.n:,} tokens)", flush=True)
-        self.api.upload_file(
-            path_or_fileobj=path,
-            path_in_repo=fname,
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
-        print(f"UPLOADED {fname} -> {self.repo_id}", flush=True)
         self.shard_idx += 1
         self.n = 0
 
@@ -110,21 +133,40 @@ class ShardWriter:
         self.flush()
 
 
-def clear_prefix(out_dir: str, prefix: str):
-    os.makedirs(out_dir, exist_ok=True)
-    for name in os.listdir(out_dir):
-        if name.startswith(prefix + "_") and name.endswith(".bin"):
-            os.remove(os.path.join(out_dir, name))
-    marker = os.path.join(out_dir, f".{prefix}.done")
-    if os.path.exists(marker):
-        os.remove(marker)
+def upload_source_folder(out_dir: str, prefix: str, repo_id: str):
+    files = prefix_files(out_dir, prefix)
+    if not files:
+        raise RuntimeError(f"no local {prefix}_*.bin files to upload from {out_dir}")
+    api = HfApi(token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    print(f"BATCH_UPLOAD {prefix}: {len(files)} local shard(s) -> {repo_id}", flush=True)
+    api.upload_folder(
+        folder_path=out_dir,
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns=[f"{prefix}_*.bin", f".{prefix}.done"],
+        commit_message=f"upload {prefix} shards",
+    )
+    print(f"BATCH_UPLOADED {prefix}: {len(files)} shard(s) -> {repo_id}", flush=True)
 
 
-def build_from_streams(out_dir: str, prefix: str, streams: list[tuple[str, object, int]], budget: int, repo_id: str):
-    clear_prefix(out_dir, prefix)
-    writer = ShardWriter(out_dir, prefix, repo_id)
-    pbar = tqdm(total=budget, unit="tok", unit_scale=True, desc=prefix)
-    count = 0
+def build_from_streams(out_dir: str, prefix: str, streams: list[tuple[str, object, int]],
+                       budget: int, repo_id: str, upload: bool):
+    local_total, local_next = local_prefix_stats(out_dir, prefix)
+    remote_total, remote_next = remote_prefix_stats(repo_id, prefix)
+    resume_tokens = max(local_total, remote_total)
+    next_idx = max(local_next, remote_next)
+    if resume_tokens > budget:
+        raise RuntimeError(f"{prefix} existing tokens {resume_tokens:,} exceed budget {budget:,}")
+
+    print(
+        f"RESUME {prefix}: local={local_total:,} remote={remote_total:,} "
+        f"resume={resume_tokens:,} next_idx={next_idx:06d}",
+        flush=True,
+    )
+    writer = ShardWriter(out_dir, prefix, next_idx)
+    pbar = tqdm(total=budget, initial=resume_tokens, unit="tok", unit_scale=True, desc=prefix)
+    count = resume_tokens
+    seen = 0
     for label, stream, part_budget in streams:
         local = 0
         print(f"OPEN {prefix}:{label} budget={part_budget:,}", flush=True)
@@ -139,10 +181,22 @@ def build_from_streams(out_dir: str, prefix: str, streams: list[tuple[str, objec
                 print(f"EXHAUSTED {prefix}:{label} after {local:,} tokens", flush=True)
                 break
             for toks in tokenize_batch(texts):
-                writer.add(toks)
-                local += len(toks)
-                count += len(toks)
-                pbar.update(len(toks))
+                ntok = len(toks)
+                start = 0
+                if seen + ntok <= resume_tokens:
+                    seen += ntok
+                    local += ntok
+                    continue
+                if seen < resume_tokens:
+                    start = resume_tokens - seen
+                seen += ntok
+                local += ntok
+                piece = toks[start:]
+                if len(piece) > budget - count:
+                    piece = piece[:budget - count]
+                writer.add(piece)
+                count += len(piece)
+                pbar.update(len(piece))
                 if local >= part_budget or count >= budget:
                     break
     pbar.close()
@@ -153,28 +207,30 @@ def build_from_streams(out_dir: str, prefix: str, streams: list[tuple[str, objec
     with open(os.path.join(out_dir, f".{prefix}.done"), "w", encoding="utf-8") as f:
         f.write(str(count))
     print(f"DONE {prefix}: {count:,} / {budget:,} tokens", flush=True)
+    if upload:
+        upload_source_folder(out_dir, prefix, repo_id)
 
 
-def build_single(out_dir: str, source: str, repo_id: str):
+def build_single(out_dir: str, source: str, repo_id: str, upload: bool):
     dataset, config, field, budget = MAIN_SOURCES[source]
     streams = [(source, doc_stream(dataset, config, field), budget)]
-    build_from_streams(out_dir, source, streams, budget, repo_id)
+    build_from_streams(out_dir, source, streams, budget, repo_id, upload)
 
 
-def build_anneal(out_dir: str, repo_id: str):
+def build_anneal(out_dir: str, repo_id: str, upload: bool):
     streams = [
         (f"{dataset}:{config}", doc_stream(dataset, config, field), budget)
         for dataset, config, field, budget in ANNEAL_PARTS
     ]
-    build_from_streams(out_dir, "anneal", streams, sum(b for *_, b in ANNEAL_PARTS), repo_id)
+    build_from_streams(out_dir, "anneal", streams, sum(b for *_, b in ANNEAL_PARTS), repo_id, upload)
 
 
-def build_code(out_dir: str, repo_id: str):
+def build_code(out_dir: str, repo_id: str, upload: bool):
     streams = [
         (dataset, doc_stream(dataset, config, field), budget)
         for dataset, config, field, budget in CODE_PARTS
     ]
-    build_from_streams(out_dir, "code", streams, sum(b for *_, b in CODE_PARTS), repo_id)
+    build_from_streams(out_dir, "code", streams, sum(b for *_, b in CODE_PARTS), repo_id, upload)
 
 
 def main():
@@ -182,14 +238,20 @@ def main():
     ap.add_argument("--out", default="/data/mix100B")
     ap.add_argument("--source", choices=["dclm", "code", "math", "anneal"], required=True)
     ap.add_argument("--repo-id", default=REPO_ID)
+    ap.add_argument("--skip-upload", action="store_true")
+    ap.add_argument("--upload-only", action="store_true")
     args = ap.parse_args()
 
+    if args.upload_only:
+        upload_source_folder(args.out, args.source, args.repo_id)
+        return
+    upload = not args.skip_upload
     if args.source == "anneal":
-        build_anneal(args.out, args.repo_id)
+        build_anneal(args.out, args.repo_id, upload)
     elif args.source == "code":
-        build_code(args.out, args.repo_id)
+        build_code(args.out, args.repo_id, upload)
     else:
-        build_single(args.out, args.source, args.repo_id)
+        build_single(args.out, args.source, args.repo_id, upload)
 
 
 if __name__ == "__main__":
