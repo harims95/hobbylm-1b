@@ -57,7 +57,7 @@ a phase.
 | D2 | seq_len 2048 (up from 1024) | 1024 caps evals and real usability; 2048 safe at RoPE θ=10k |
 | D3 | Consider top_k 8→12 ONLY if the Phase 2 ablation says so | 1B preset is ~7× sparse (~140M active); evals compare vs dense 360–600M. Prior ablation favored more active experts. Gated on evidence, not vibes |
 | D4 | **Tokenizer = GPT-2 (vocab 50,304), NOT SmolLM2** | Phase 0.3 measured only 4.19% fewer tokens with SmolLM2 on a ~200MB mix sample, below the 5% threshold. Keep 130M comparability and avoid vocab/eval/Rust/GGUF churn. IDs still fit uint16 |
-| D5 | Data = 100B curated mix: 60% FineWeb-Edu, 15% DCLM, 10% code (Stack-Edu, multi-language), 10% FineMath, 5% anneal | 10× scale of the validated 5B mix; code source upgraded to Stack-Edu (see §5a) |
+| D5 | Data = 100B curated mix: 60% FineWeb-Edu from Karpathy's byte-verified GPT-2 shards, 15% DCLM, 10% code (Stack-Edu, multi-language), 10% FineMath, 5% anneal | 10× scale of the validated 5B mix; only the non-edu 40B must be built on Modal; code source upgraded to Stack-Edu (see §5a) |
 | D6 | Fixed seeded-shuffle loader (commit `ac55e3a`), verified before spend | The single most expensive bug we know of |
 | D7 | Two-phase training: main 85% + anneal 15% | Validated at 130M |
 | D8 | Data build + backup + evals + SFT on **Modal**; **flagship training on Vast** | Modal convenient/cheap for small jobs; Vast ~35% cheaper for the one big job + brother's $370 credit |
@@ -85,23 +85,30 @@ a phase.
 
 ---
 
-## 5. PHASE 1 — BUILD & BACK UP THE 100B DATA (Modal, ~$10 + upload, ~8–9h parallel)
+## 5. PHASE 1 — BUILD & BACK UP THE 100B DATA (Modal, ~$5 + upload, ~4–5h parallel)
 
-1. Fix the two known issues up front: add `HF_TOKEN` as a Modal secret (rate limits) and
-   keep the >90%-budget `.done` guard.
-2. **Parallel build** — one Modal CPU function per source, running simultaneously
-   (FineWeb-Edu is the ~8h bottleneck; others finish sooner). For speed, optionally split
-   FineWeb-Edu into 4 sub-workers over dataset slices → whole build ~2–3h. cpu=4,
-   memory=32768, timeout=86400, **detached**.
-   - FineWeb-Edu 60B (switch config from `sample-10BT` to full / `sample-100BT`)
-   - DCLM 15B, code 10B (the-stack-smol + smollm-corpus python-edu), FineMath 10B
+1. Fix the two known issues up front: add `HF_TOKEN` as the Modal `huggingface` secret
+   (rate limits) and keep the >90%-budget `.done` guard.
+2. **Use byte-verified external edu shards** for the 60B FineWeb-Edu slice:
+   `karpathy/fineweb-edu-100B-gpt2-token-shards`. We verified
+   `edu_fineweb_train_000001.bin` matches the repo loader byte-for-byte:
+   magic `20240520`, version `1`, 256-int32 header, 100M uint16 GPT-2 tokens, EOT
+   token `50256` at document boundaries.
+3. **Parallel build only the remaining 40B on Modal** — one CPU function per source,
+   running simultaneously. cpu=4, memory=32768, timeout=86400, **detached**.
+   - DCLM 15B
+   - code 10B (Stack-Edu, multi-language)
+   - FineMath 10B
    - anneal 5B (cosmopedia-v2 70% + finemath-4plus 30%), separate shards
-   - If a source exhausts early, backfill the shortfall from FineWeb-Edu; log it.
-3. **Upload each shard to HF as it's written** (D9): private repo
+   - If a source exhausts early, backfill the shortfall from another compatible source;
+     log it rather than silently underfilling.
+4. **Upload each new shard to HF as it's written** (D9): private repo
    `harims95/hobbylm-mix100b-gpt2`. Non-blocking/resumable — a failed upload logs and
    continues, never crashes the build; track uploaded shards in a manifest. README:
    tokenizer (GPT-2, 50,304), shard format, mix ratios, per-source token counts, seed 1337.
-4. **Verify (free):** total ≈ 200GB / ~1,000 shards; decode ~200 tokens each from an edu,
+   The manifest should include the Karpathy edu shard filenames plus checksums/headers so
+   Vast can reconstruct the full 100B set without rebuilding edu.
+5. **Verify (free):** total ≈ 200GB / ~1,000 shards; decode ~200 tokens each from an edu,
    code, and math shard (English/code/math readable); run the shuffle-verification script
    over the 1B patterns — first 40 shards must be interleaved, not grouped.
 
