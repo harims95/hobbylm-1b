@@ -39,11 +39,7 @@ ANNEAL_PARTS = [
 ]
 
 CODE_PARTS = [
-    ("Python", 7_000_000_000),
-    ("JavaScript", 750_000_000),
-    ("Java", 750_000_000),
-    ("Cpp", 750_000_000),
-    ("Go", 750_000_000),
+    ("codeparrot/codeparrot-clean", None, "content", 10_000_000_000),
 ]
 
 
@@ -51,14 +47,6 @@ def doc_stream(dataset: str, config: str | None, field: str):
     ds = load_dataset(dataset, config, split="train", streaming=True)
     for row in ds:
         text = row.get(field) or row.get("content") or row.get("text") or ""
-        if text and len(text) > 80:
-            yield text
-
-
-def stack_edu_stream(config: str):
-    ds = load_dataset("HuggingFaceTB/stack-edu", config, split="train", streaming=True)
-    for row in ds:
-        text = row.get("content") or row.get("text") or row.get("source") or ""
         if text and len(text) > 80:
             yield text
 
@@ -182,8 +170,11 @@ def build_anneal(out_dir: str, repo_id: str):
 
 
 def build_code(out_dir: str, repo_id: str):
-    streams = [(lang, stack_edu_stream(lang), budget) for lang, budget in CODE_PARTS]
-    build_from_streams(out_dir, "code", streams, sum(b for _, b in CODE_PARTS), repo_id)
+    streams = [
+        (dataset, doc_stream(dataset, config, field), budget)
+        for dataset, config, field, budget in CODE_PARTS
+    ]
+    build_from_streams(out_dir, "code", streams, sum(b for *_, b in CODE_PARTS), repo_id)
 
 
 def main():
