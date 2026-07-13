@@ -95,7 +95,8 @@ def main():
     ap.add_argument("--val_every", type=int, default=250)
     ap.add_argument("--out_dir", default="runs")
     ap.add_argument("--save_every", type=int, default=0, help="save a checkpoint every N steps (0=only final)")
-    ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--no_compile", action="store_true",
+                    help="run fully eager: skip torch.compile(model) and nested custom-op compiles")
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"],
                     help="Muon orthogonalizer: ns5 (Newton-Schulz) or polar (Polar Express)")
     ap.add_argument("--init_from", default="", help="checkpoint .pt to resume model weights from (continued pretrain)")
@@ -105,6 +106,8 @@ def main():
     args = ap.parse_args()
     if args.init_from and args.resume:
         raise SystemExit("use only one of --init_from or --resume")
+    if args.no_compile:
+        os.environ["HOBBYLM_NO_COMPILE"] = "1"
 
     # ---- DDP setup ----
     ddp = "RANK" in os.environ
@@ -158,6 +161,8 @@ def main():
     raw_model = model
     if tc.compile:
         model = torch.compile(model)
+    else:
+        log("torch.compile disabled (--no_compile): running eager model/custom ops")
     if ddp:
         model = DDP(model, device_ids=[local_rank])
 
