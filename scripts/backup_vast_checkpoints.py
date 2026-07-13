@@ -29,6 +29,27 @@ def snapshot(run_dir: Path) -> tuple[int, float]:
     return len(files), max(p.stat().st_mtime for p in files)
 
 
+def checkpoint_step(path: Path) -> int:
+    try:
+        return int(path.stem.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def prune_old_checkpoints(run_dir: Path, keep: int, dry_run: bool = False) -> list[Path]:
+    ckpts = sorted(run_dir.glob("ckpt_*.pt"), key=checkpoint_step)
+    victims = ckpts[:-keep] if keep > 0 else ckpts
+    for path in victims:
+        print(f"{'would_delete' if dry_run else 'delete'} {path}", flush=True)
+        if not dry_run:
+            path.unlink()
+    kept = ckpts[-keep:] if keep > 0 else []
+    print("kept_ckpts " + " ".join(p.name for p in kept), flush=True)
+    if (run_dir / "model.pt").exists():
+        print("kept_model model.pt", flush=True)
+    return victims
+
+
 def backup_once(args: argparse.Namespace, token: str | None) -> None:
     run_dir = Path(args.run_dir)
     if not run_dir.exists():
@@ -40,6 +61,9 @@ def backup_once(args: argparse.Namespace, token: str | None) -> None:
         return
     if args.dry_run:
         print("dry_run: no upload", flush=True)
+        if args.show_prune_plan:
+            print("post_upload_prune_plan:", flush=True)
+            prune_old_checkpoints(run_dir, args.keep_local_ckpts, dry_run=True)
         return
 
     HfApi(token=token).create_repo(args.repo_id, repo_type=args.repo_type,
@@ -54,6 +78,8 @@ def backup_once(args: argparse.Namespace, token: str | None) -> None:
         token=token,
     )
     print(f"uploaded {n_files} file(s) to {args.repo_id}/{args.path_in_repo}", flush=True)
+    if args.keep_local_ckpts >= 0:
+        prune_old_checkpoints(run_dir, args.keep_local_ckpts)
 
 
 def main() -> None:
@@ -68,6 +94,10 @@ def main() -> None:
                     help="Keep running and upload at most once per interval when files changed.")
     ap.add_argument("--upload", action="store_true",
                     help="Actually upload. Omit for dry-run.")
+    ap.add_argument("--keep-local-ckpts", type=int, default=3,
+                    help="After a successful upload, keep only the newest N ckpt_*.pt files locally. model.pt is never deleted.")
+    ap.add_argument("--show-prune-plan", action="store_true",
+                    help="In dry-run mode, print what would be deleted after a successful upload.")
     ap.add_argument("--public", action="store_true")
     ap.add_argument("--env-file", default=".env")
     args = ap.parse_args()

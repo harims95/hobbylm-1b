@@ -48,11 +48,23 @@ def parse_overrides(pairs: list[str]) -> dict:
         k, v = p.split("=", 1)
         if v.lower() in ("true", "false"):
             out[k] = v.lower() == "true"
-        elif v.replace(".", "", 1).replace("-", "", 1).isdigit():
-            out[k] = float(v) if "." in v else int(v)
         else:
-            out[k] = v
+            try:
+                out[k] = int(v)
+            except ValueError:
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v
     return out
+
+
+def assert_clean_resume(missing, unexpected, resume_path: str) -> None:
+    if missing or unexpected:
+        raise RuntimeError(
+            f"resume checkpoint architecture mismatch for {resume_path}: "
+            f"missing={list(missing)} unexpected={list(unexpected)}"
+        )
 
 
 def resolve_pattern(data_dir: str, pattern: str) -> str:
@@ -157,6 +169,7 @@ def main():
         ck = torch.load(resume_path, map_location=device, weights_only=False)
         missing, unexpected = raw_model.load_state_dict(ck["model"], strict=False)
         if args.resume:
+            assert_clean_resume(missing, unexpected, resume_path)
             if "muon" in ck:
                 muon.load_state_dict(ck["muon"])
             if "adamw" in ck:

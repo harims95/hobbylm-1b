@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
@@ -48,11 +47,13 @@ def select_files(api: HfApi) -> tuple[list[str], dict[str, list[str]]]:
 
 
 def copy_hf_file(repo_id: str, filename: str, out_dir: Path, token: str | None) -> None:
-    cached = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", token=token)
-    dst = out_dir / Path(filename).name
-    if dst.exists() and dst.stat().st_size == Path(cached).stat().st_size:
-        return
-    shutil.copy2(cached, dst)
+    hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="dataset",
+        token=token,
+        local_dir=out_dir,
+    )
 
 
 def print_group(name: str, files: list[str], list_files: bool) -> None:
