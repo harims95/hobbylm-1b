@@ -34,9 +34,44 @@ def expand_patterns(patterns: str) -> list[str]:
     return files
 
 
-def shard_order(patterns: str, shuffle_shards: bool = False, seed: int = 1337, cycle: int = 0) -> list[str]:
+def shard_family(path: str) -> str:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if name.startswith("edu_fineweb_train_"):
+        return "edu"
+    return name.split("_", 1)[0]
+
+
+def stratified_shard_order(files: list[str], seed: int = 1337, cycle: int = 0) -> list[str]:
+    by_family: dict[str, list[str]] = {}
+    for fp in files:
+        by_family.setdefault(shard_family(fp), []).append(fp)
+
+    rng = random.Random(seed + cycle)
+    for family_files in by_family.values():
+        rng.shuffle(family_files)
+
+    total = len(files)
+    targets = {family: len(family_files) for family, family_files in by_family.items()}
+    used = {family: 0 for family in by_family}
+    order = []
+    for pos in range(total):
+        # Pick the family most behind its ideal cumulative count. This is a small
+        # "carryover" scheduler: exact totals, but near-target ratios in every window.
+        family = max(
+            (f for f in by_family if used[f] < targets[f]),
+            key=lambda f: (targets[f] * (pos + 1) / total) - used[f],
+        )
+        order.append(by_family[family][used[family]])
+        used[family] += 1
+    return order
+
+
+def shard_order(patterns: str, shuffle_shards: bool = False, seed: int = 1337,
+                cycle: int = 0, stratified: bool = False) -> list[str]:
     files = expand_patterns(patterns)
     assert files, f"no data files match {patterns}"
+    if stratified:
+        return stratified_shard_order(files, seed=seed, cycle=cycle)
     if not shuffle_shards or len(files) <= 1:
         return files
 
@@ -47,7 +82,8 @@ def shard_order(patterns: str, shuffle_shards: bool = False, seed: int = 1337, c
 
 
 def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: int = 1,
-                   to_device: bool = True, shuffle_shards: bool = False, seed: int = 1337):
+                   to_device: bool = True, shuffle_shards: bool = False, seed: int = 1337,
+                   stratified_shards: bool = False):
     """Yields (x, y) of shape (B, S). If to_device is False, yields pinned CPU long tensors
     (for an async prefetcher to copy H2D while the GPU computes)."""
     files = expand_patterns(pattern)
@@ -56,7 +92,8 @@ def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: i
     pin = (not to_device) and torch.cuda.is_available()
     cycle = 0
     while True:
-        order = shard_order(pattern, shuffle_shards=shuffle_shards, seed=seed, cycle=cycle)
+        order = shard_order(pattern, shuffle_shards=shuffle_shards, seed=seed,
+                            cycle=cycle, stratified=stratified_shards)
         for fp in order:
             toks = load_shard(fp)
             n_blocks = (len(toks) - 1) // block

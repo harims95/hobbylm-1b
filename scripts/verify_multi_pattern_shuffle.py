@@ -29,6 +29,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--patterns", default="")
     ap.add_argument("--count", type=int, default=40)
+    ap.add_argument("--stratified", action="store_true")
     args = ap.parse_args()
 
     if args.patterns:
@@ -37,7 +38,7 @@ def main() -> None:
         tmp = tempfile.TemporaryDirectory()
         patterns = make_demo_shards(Path(tmp.name))
 
-    order = shard_order(patterns, shuffle_shards=True, seed=1337)
+    order = shard_order(patterns, shuffle_shards=True, seed=1337, stratified=args.stratified)
     families = [family_name(path) for path in order[:args.count]]
     print(" ".join(families))
 

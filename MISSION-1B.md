@@ -156,23 +156,25 @@ Skip entirely if budget is tight — it's optimization, not a requirement.
 Prove the Vast execution path cheaply before the $600 job rides on it.
 
 1. **Pick a host** (verified datacenter, on-demand, reliability ≥99.5%, max-duration ≥1
-   month, 4×H100 SXM on ONE machine, disk ≥500GB NVMe). Never interruptible for the
+   month, 8×H100 SXM on ONE machine, disk ≥500GB NVMe). Never interruptible for the
    flagship; never split across two hosts (no InfiniBand on Vast marketplace).
 2. `vastai` CLI: create SSH key, search/filter, `create instance`, SSH in, `tmux`.
 3. Environment: clone the fork (`feat/curated-data-mix-130m` + 1B mission updates), install
    deps (Docker image or pip), download a SMALL slice of shards from the HF backup (D9) to
    the box.
 4. Launch a tiny run with **plain torchrun** (not modal_train.py):
-   `torchrun --nproc_per_node=4 training/train.py --preset 130M --max-steps 200 ...`
+   `torchrun --nproc_per_node=8 training/train.py --preset 130M --max-steps 200 ...`
    with checkpoints every 50 steps to a persistent location (Vast volume or push to HF).
 5. **Shakedown gates:** first loss ≈ ln(50304) ≈ 10.8; loss falls; checkpoint saves AND
-   resumes after a deliberate kill; step time sane. If all pass, the Vast path is trusted.
+   resumes after a deliberate kill; step time sane. At seq_len 2048, `micro_batch_seqs=4`
+   on 4×H100 is an OOM unknown until measured; if it OOMs, tune micro-batch down on the
+   shakedown before any flagship launch. If all pass, the Vast path is trusted.
    If not, fix on the cheap run — never debug on the flagship.
 6. Destroy the shakedown instance (stop paying).
 
 ---
 
-## 8. PHASE 4 — THE FLAGSHIP (Vast, ~$600–850, ~45h) [HUMAN GATE before launch]
+## 8. PHASE 4 — THE FLAGSHIP (Vast, ~$600–850, ~45h on 8×H100 SXM) [HUMAN GATE before launch]
 
 1. **Recompute the run:** 100B tokens ÷ (batch tokens/step) = total steps; main = 85%,
    anneal = 15%; `schedule_max_steps` = total. At seq 2048, re-probe throughput with a
@@ -184,10 +186,12 @@ Prove the Vast execution path cheaply before the $600 job rides on it.
    full 200GB shard set from HF backup to the box. Verify shard count + a decode sample.
 4. **Sanity run first (~$3):** 200 steps attached in tmux; confirm loss ~10.8 falling,
    checkpoint resume works, step time matches the probe. Only then the real run.
-5. **Launch main phase, detached in tmux, torchrun 4×H100:** train pattern = all main-mix
+5. **Launch main phase, detached in tmux, torchrun 8×H100:** train pattern = all main-mix
    shards SHUFFLED (loader fix), val on a held slice, `schedule_max_steps` = total,
-   `fused_ce` on, **checkpoint every 15–30 min** to a persistent Vast volume AND pushed to
-   HF (marketplace hosts can vanish). Log run-name, config, start time to RESULTS-1B.md.
+   `fused_ce` on, **checkpoint every 15–30 min** to a persistent Vast volume AND push to
+   HF with the batched sidecar:
+   `python scripts/backup_vast_checkpoints.py --run-dir /workspace/runs/1b_main_vast --upload --watch --interval-minutes 30`.
+   Never upload checkpoints one-by-one. Log run-name, config, start time to RESULTS-1B.md.
 6. **Monitor** (SSH, every few hours): loss smooth (Muon+QK-norm → no spikes); expert load
    balanced (no expert at ~0% traffic); run lmeval on intermediate checkpoints every ~10%
    of steps — the avg should climb. **Standing rules:** on crash/host-loss, resume from the
@@ -249,7 +253,7 @@ Prove the Vast execution path cheaply before the $600 job rides on it.
 | 1 | 100B data build + HF backup (Modal CPU) | ~$10 + storage |
 | 2 | Optional top_k ablation (Modal) | ~$40 |
 | 3 | Vast shakedown (130M, ~$5) | ~$5 |
-| 4 | Flagship (Vast, ~45h, 4×H100) | ~$600–850 |
+| 4 | Flagship (Vast, ~45h, 8×H100 SXM single host; ~360 GPU-hours) | ~$600–850 |
 | 5 | Evals + GGUF (Modal) | ~$30 |
 | 5 | Post-train SFT+DPO (Modal, optional) | ~$100 |
 | — | HF storage (200GB, few months) | ~$0–20 |

@@ -3,7 +3,13 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.env.*
 *.key
+*.pem
+*.p8
+*.p12
+id_rsa
+id_ed25519
 
 # --- Model weights & exports (download from HuggingFace: rootxhacker/HobbyLM-*) ---
 *.pt
