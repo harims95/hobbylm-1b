@@ -4,8 +4,13 @@ param(
     [int]$OfferId = 0,
     [int]$InstanceId = 0,
     [int]$DiskGb = 500,
-    [string]$Image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel",
-    [string]$Label = "hobbylm-1b-shakedown-8xh100"
+    [int]$GpuCount = 4,
+    [string]$GpuName = "H100_SXM",
+    [double]$MinReliability = 0.995,
+    [int]$MinDurationDays = 30,
+    [string]$Image = "vastai/pytorch",
+    [string]$Label = "hobbylm-1b-shakedown",
+    [string]$OnstartCmd = "python -m pip install --upgrade pip && python -m pip install huggingface-hub tqdm tiktoken numpy"
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,7 +33,7 @@ if (-not (Test-Path $vastai)) {
 $env:XDG_CONFIG_HOME = Join-Path $env:TEMP "vastai-codex-config"
 $env:XDG_CACHE_HOME = Join-Path $env:TEMP "vastai-codex-cache"
 
-$query = "datacenter=True verified=True rentable=True reliability>=0.995 num_gpus=8 gpu_name=H100_SXM disk_space>=$DiskGb duration>=30"
+$query = "datacenter=True verified=True rentable=True reliability>=$MinReliability num_gpus=$GpuCount gpu_name=$GpuName disk_space>=$DiskGb duration>=$MinDurationDays"
 
 switch ($Action) {
     "search" {
@@ -36,7 +41,17 @@ switch ($Action) {
     }
     "create" {
         if ($OfferId -le 0) { throw "Pass -OfferId from the search output." }
-        & $vastai --api-key $apiKey --raw create instance $OfferId --image $Image --disk $DiskGb --ssh --direct --label $Label --cancel-unavail
+        $createJson = & $vastai --api-key $apiKey --raw create instance $OfferId --image $Image --disk $DiskGb --ssh --direct --label $Label --onstart-cmd $OnstartCmd --cancel-unavail
+        try {
+            $created = $createJson | ConvertFrom-Json
+            [pscustomobject]@{
+                success = $created.success
+                new_contract = $created.new_contract
+            } | ConvertTo-Json
+        }
+        catch {
+            $createJson
+        }
     }
     "ssh-url" {
         if ($InstanceId -le 0) { throw "Pass -InstanceId." }
