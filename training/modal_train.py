@@ -148,6 +148,32 @@ def build_mix_source(source: str, scale: float = 0.5, out: str = "/data/mix5B"):
     return {"out": out, "scale": scale, "source": source}
 
 
+@app.function(image=mix_image, cpu=4, memory=32768, volumes={"/data": vol, "/cache/hf": hf_cache},
+              timeout=86400, secrets=[modal.Secret.from_name("huggingface")])
+def build_100b_source(source: str, out: str = "/data/mix100B",
+                      repo_id: str = "harims95/hobbylm-mix100b-gpt2"):
+    """Build one non-edu Phase 1 source, commit it, then batch-upload local shards to HF."""
+    import os
+    import subprocess
+
+    os.chdir("/root/moe-lab")
+    os.makedirs(out, exist_ok=True)
+    build_cmd = [
+        "python", "prepare_mix100B.py", "--out", out, "--source", source,
+        "--repo-id", repo_id, "--skip-upload",
+    ]
+    print("RUN:", " ".join(build_cmd), flush=True)
+    subprocess.run(build_cmd, check=True)
+    vol.commit()
+    print(f"COMMITTED {source} shards to Modal volume before HF upload", flush=True)
+
+    upload_cmd = ["python", "prepare_mix100B.py", "--out", out, "--source", source,
+                  "--repo-id", repo_id, "--upload-only"]
+    print("RUN:", " ".join(upload_cmd), flush=True)
+    subprocess.run(upload_cmd, check=True)
+    return {"out": out, "source": source, "repo_id": repo_id}
+
+
 # ---- throughput-optimization presets: (model-config --set overrides, orthogonalizer) ----
 # SHIPPING: all_safe (fused_ce + polar). fused_ce is the win: +6% step time, -21% peak memory,
 # enables ~2x larger batch, numerics-identical.
@@ -827,13 +853,18 @@ def main(action: str = "train", preset: str = "130M", steps: int = 4000,
          lr_mult: float = 1.0, gpu_type: str = "H100", mix_scale: float = 0.5,
          mix_out: str = "/data/mix5B", phase: str = "both", seed: int = 1337,
          shuffle_shards: int = 0, schedule_max_steps: int = 0,
-         ckpt: str = "model.pt"):
+         ckpt: str = "model.pt", source: str = ""):
     data_dir = data_dir or DATASETS[data][1]
     if action == "prep_data":
         prep_data.remote(tasks or "mmlu")
         return
     if action == "build_mix":
         build_mix.remote(mix_scale, mix_out, phase, seed)
+        return
+    if action == "build_100b_source":
+        if not source:
+            raise SystemExit("--source is required for action=build_100b_source")
+        build_100b_source.remote(source, mix_out if mix_out else "/data/mix100B")
         return
     if action == "smoke_mix":
         build_mix.remote(0.001, "/data/tiny", "both", 1337)

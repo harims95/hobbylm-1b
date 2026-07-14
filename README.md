@@ -1,104 +1,65 @@
-# HobbyLM
+# HobbyLM-1B
 
-HobbyLM is a small language-model family I built from scratch on a hobby budget — a 500M-parameter
-sparse Mixture-of-Experts model, the training code that produced it, a from-scratch Rust engine that
-runs it on a laptop CPU, and a desktop app that wraps the whole thing. No cluster, no borrowed
-weights: just FineWeb, a handful of Modal H100 hours, and a lot of ablations.
+A 1B-parameter sparse MoE language model project trained on a curated 100B-token mix.
 
-The goal was to see how far you can actually get at the ~500M scale if you sweat the architecture and
-the systems work — and to own every layer of the stack end to end, from the optimizer to the GGUF
-reader to the click-to-run app.
+This repository is built on Harish's HobbyLM codebase:
+https://github.com/harishsg993010/HobbyLM
 
-## The models
+## Status
 
-Every variant shares one 500M sparse-MoE core and is published on Hugging Face under
-[`rootxhacker`](https://huggingface.co/rootxhacker):
+The 100B-token data recipe is built and verified. The Vast training pipeline is ready. The flagship 1B run is pending the final Vast shakedown and launch gate.
 
-- **HobbyLM-Base** — the pretrained foundation model (FineWeb).
-- **HobbyLM-Chat** — instruction / conversation tuned.
-- **HobbyLM-Computer-Use** — function calling + an accessibility-tree GUI agent.
-- **HobbyLM-Omni** — multimodal: text + image + audio (TinyLLaVA-style, with vision and speech projectors).
-- **HobbyLM-Diffusion** — a masked-diffusion (LLaDA-style) variant for parallel, bidirectional decoding.
-- **HobbyLM-Image** — a separate 1024px text-to-image diffusion model (a DiT, not a language model).
+## Credits
 
-Each model repo ships `safetensors` + `config.json`; the GGUF builds live in **HobbyLM-gguf**.
+- Base architecture, MoE trainer, Muon setup, and Rust inference engine: Harish (`harishsg993010`)
+- Curated 100B data recipe, loader shuffle fix, Vast training pipeline, and 1B scaling: us
+- Testing and validation: Prajan
 
-## Architecture, briefly
+## Validation
 
-A decoder-only transformer with the modern small-MoE recipe, where each piece was chosen by ablation
-rather than vibes:
+The 130M validation run on the curated mix scored about `43.3` average on the 7-task eval suite, versus the `42.97` FineWeb baseline, while using half the tokens. That result green-lit the data recipe for the 1B flagship.
 
-- **Sparse MoE FFN** — 36 fine-grained experts, top-6 routed, plus one always-on shared expert; the
-  first layer stays dense (DeepSeekMoE style).
-- **Sigmoid gating** with DeepSeek-V3's **aux-loss-free** load balancing — a learned bias steers which
-  experts get picked while the gate weights stay raw, so nothing fights the language-modeling objective.
-- **GQA** attention with **per-head QK-norm** applied before RoPE, and a decoupled head dimension.
-- Pre-norm **RMSNorm**, **RoPE**, tied embeddings, GPT-2 byte-level BPE.
-- Trained with **Muon** (on the 2-D and per-expert 3-D matrices) and AdamW for the rest.
+## Data Recipe
 
-There are 130M / 500M / 1B presets; 500M is the one that got the full treatment. The design notes and
-the ablations behind each decision are in [`docs/ARCHITECTURE_RESEARCH.md`](docs/ARCHITECTURE_RESEARCH.md).
+Tokenizer: GPT-2, padded to vocab size `50,304`.
 
-## Running it — `hobby-rs`
+Main phase:
 
-`hobby-rs/` is a from-scratch CPU inference engine in Rust. It memory-maps a HobbyLM GGUF, runs the
-sparse MoE natively (only the active experts are computed), and streams tokens — no llama.cpp, no
-Python, no ONNX at runtime. The matmul hot path is hand-written AVX2/SIMD, and every hyperparameter is
-read from the GGUF metadata, so nothing is hardcoded.
+- `60%` FineWeb-Edu from byte-verified Karpathy GPT-2 shards
+- `15%` DCLM
+- `10%` code
+- `10%` FineMath
 
-```bash
-cd hobby-rs
-cargo build --release
-./target/release/hobby-rs --model HobbyLM-Chat.gguf --prompt "The capital of France is" --n 48
-```
+Anneal phase:
 
-The GGUFs declare a custom `hobbylm` architecture. They load directly in `hobby-rs`; stock llama.cpp
-would need the `hobbylm` arch registered first.
+- `5%` anneal slice
 
-## Chatting with it — `hobby-chat`
+The Vast staging script downloads exactly `600` FineWeb-Edu shards, plus the `400` built shards from `harims95/hobbylm-mix100b-gpt2`, and stages the original FineWeb validation shard.
 
-`hobby-chat/` is a small Tauri desktop app (Rust backend + web UI): a local, ChatGPT-style window that
-embeds `hobby-rs` along with the multimodal encoders, computer-use (Windows UI-Automation accessibility
-tree), and an MCP client for tool use. Point it at a GGUF and everything runs on your machine.
+## Training Plan
 
-## Training it — `training/` + Modal
+Target hardware: `4x H100 SXM` on Vast as the available fallback host class. The scripts keep `nproc_per_node` configurable so the run can switch to `8x H100 SXM` if a suitable single-machine host appears.
 
-The training stack is plain PyTorch, run on [Modal](https://modal.com) serverless GPUs (1–8× H100):
-FineWeb in, checkpoints out, with the full ablation suite a flag away.
+Training is two-phase:
+
+- Main phase on `edu + dclm + code + math`, using stratified shard interleaving.
+- Anneal phase resuming from the main checkpoint on `anneal_*.bin`.
+
+Core launch path:
 
 ```bash
-python -m hobbylm.count_params --smoke                                    # local CPU sanity check
-python -m modal run training/modal_train.py --action train --preset 500M  # train on Modal H100s
-python -m modal run training/modal_train.py --action ablate --steps 3000  # run the architecture ablations
+python scripts/launch_vast_train.py
 ```
 
-Multimodal, tool-use, diffusion, and image-generation training live in `training/modal_mm.py`,
-`training/modal_tools.py`, `training/modal_dreamlite.py`, and the `hobby_image/` package.
+The launcher prints the exact `torchrun --standalone --nproc_per_node=4 training/train.py ...` command by default. Add `--run` on the Vast host to execute.
 
-## Layout
+## Vast Pipeline
 
-```
-hobbylm/        core importable library: model.py, moe.py, config.py, optim.py,
-                multimodal/vision/audio/speech encoders, generate, tool + eval utils
-training/       train*.py + Modal harnesses (modal_train/mm/tools/dreamlite/hobbylm)
-export/         to_gguf.py, to_aproj.py, to_mmproj.py — GGUF / projector / safetensors export
-agents/         computer-use + UI agent loops
-eval/           tool-use and VLM eval harness runners
-tests/          smoke + integration tests
-docs/           architecture notes + plans
-assets/         small test fixtures (jfk.wav, test_dog.jpg)
-hobby_image/    text-to-image diffusion model package (DiT + U-Net)
-hobby-rs/       Rust CPU inference engine
-hobby-rs-cli/   standalone CLI build of the engine
-hobby-chat/     Tauri desktop app
-```
+The Vast conversion is split into small, reviewable helpers:
 
-## Honest status
+- `scripts/vast_instance.ps1`: search/create/ssh/destroy Vast instances using the Vast API key from the environment only.
+- `scripts/stage_vast_data.py`: stage the 100B data mix and validation shard from Hugging Face.
+- `scripts/launch_vast_train.py`: print or run the plain `torchrun` training command.
+- `scripts/backup_vast_checkpoints.py`: batch-upload checkpoints with `upload_folder()` to avoid Hugging Face commit-rate limits.
 
-This is a research / hobby project at the 500M scale. It's genuinely fluent and the multimodal and
-agent pieces work, but it carries the capability ceiling of a small model — it isn't meant to compete
-with frontier systems. Weights aren't checked into the repo; grab them from Hugging Face.
-
-## License
-
-Apache-2.0.
+No secrets should be committed. Keep credentials in environment variables or ignored `.env` files only.

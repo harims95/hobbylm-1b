@@ -48,11 +48,23 @@ def parse_overrides(pairs: list[str]) -> dict:
         k, v = p.split("=", 1)
         if v.lower() in ("true", "false"):
             out[k] = v.lower() == "true"
-        elif v.replace(".", "", 1).replace("-", "", 1).isdigit():
-            out[k] = float(v) if "." in v else int(v)
         else:
-            out[k] = v
+            try:
+                out[k] = int(v)
+            except ValueError:
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v
     return out
+
+
+def assert_clean_resume(missing, unexpected, resume_path: str) -> None:
+    if missing or unexpected:
+        raise RuntimeError(
+            f"resume checkpoint architecture mismatch for {resume_path}: "
+            f"missing={list(missing)} unexpected={list(unexpected)}"
+        )
 
 
 def resolve_pattern(data_dir: str, pattern: str) -> str:
@@ -78,10 +90,13 @@ def main():
     ap.add_argument("--micro_batch_seqs", type=int, default=16)
     ap.add_argument("--shuffle_shards", action="store_true",
                     help="shuffle shard order each pass through the dataset (deterministic by seed)")
+    ap.add_argument("--stratified_shards", action="store_true",
+                    help="shuffle within shard families, then interleave families in near-target proportions")
     ap.add_argument("--val_every", type=int, default=250)
     ap.add_argument("--out_dir", default="runs")
     ap.add_argument("--save_every", type=int, default=0, help="save a checkpoint every N steps (0=only final)")
-    ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--no_compile", action="store_true",
+                    help="run fully eager: skip torch.compile(model) and nested custom-op compiles")
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"],
                     help="Muon orthogonalizer: ns5 (Newton-Schulz) or polar (Polar Express)")
     ap.add_argument("--init_from", default="", help="checkpoint .pt to resume model weights from (continued pretrain)")
@@ -91,6 +106,8 @@ def main():
     args = ap.parse_args()
     if args.init_from and args.resume:
         raise SystemExit("use only one of --init_from or --resume")
+    if args.no_compile:
+        os.environ["HOBBYLM_NO_COMPILE"] = "1"
 
     # ---- DDP setup ----
     ddp = "RANK" in os.environ
@@ -144,6 +161,8 @@ def main():
     raw_model = model
     if tc.compile:
         model = torch.compile(model)
+    else:
+        log("torch.compile disabled (--no_compile): running eager model/custom ops")
     if ddp:
         model = DDP(model, device_ids=[local_rank])
 
@@ -155,6 +174,7 @@ def main():
         ck = torch.load(resume_path, map_location=device, weights_only=False)
         missing, unexpected = raw_model.load_state_dict(ck["model"], strict=False)
         if args.resume:
+            assert_clean_resume(missing, unexpected, resume_path)
             if "muon" in ck:
                 muon.load_state_dict(ck["muon"])
             if "adamw" in ck:
@@ -176,7 +196,8 @@ def main():
     schedule_max_steps = args.schedule_max_steps or tc.max_steps
     train_gen = data_generator(train_pattern, B, S, device,
                                rank, world, to_device=False,
-                               shuffle_shards=args.shuffle_shards, seed=tc.seed)
+                               shuffle_shards=args.shuffle_shards, seed=tc.seed,
+                               stratified_shards=args.stratified_shards)
     train_prefetch = CUDAPrefetcher(train_gen, device)   # overlaps H2D copy with compute
     val_pattern = resolve_pattern(tc.data_dir, tc.val_pattern)
     log(f"batch_tokens={tc.batch_tokens} micro=({B}x{S})x{world} accum={accum} "
@@ -199,6 +220,7 @@ def main():
                 "batch_tokens": tc.batch_tokens,
                 "micro_batch_seqs": tc.micro_batch_seqs,
                 "shuffle_shards": args.shuffle_shards,
+                "stratified_shards": args.stratified_shards,
                 "seed": tc.seed,
             },
         }, indent=2))
@@ -219,6 +241,7 @@ def main():
                         "batch_tokens": tc.batch_tokens,
                         "micro_batch_seqs": tc.micro_batch_seqs,
                         "shuffle_shards": args.shuffle_shards,
+                        "stratified_shards": args.stratified_shards,
                         "seed": tc.seed,
                     },
                     **extra}, out_dir / fname)
