@@ -36,7 +36,7 @@ Status: compile-hang fix is committed on `fix/vast-compile-hang` (`d4874cb`) but
 
 ## Jarvis Labs Path
 
-Status: completed on 2026-07-14 UTC for the single-GPU compile-fix shakedown. The run trained through step 20, wrote a checkpoint, and exited cleanly, so the old pre-step-0 compile hang did not reproduce. Jarvis account shows `$500` grants available.
+Status: completed on 2026-07-14 UTC for both the single-GPU and multi-GPU Jarvis compile-fix shakedowns. The runs trained through step 20, wrote checkpoints, and exited cleanly, so the old pre-step-0 compile hang did not reproduce. Jarvis grants went from about `$500` to `$493.90` during the validation cycle.
 
 - Auth: `jl` CLI reads `JL_API_KEY` from the environment (CLI arg > `JL_API_KEY` > `~/.config/jl/config.toml`). Same pattern as Vast's `VAST_API_KEY` — key lives in `.env`/shell env, never in repo files.
 - `scripts/jarvis_instance.ps1`: mirrors `vast_instance.ps1` but wraps the `jl` CLI (`gpus`, `create`, `list`, `get`, `ssh`, `pause`, `resume`, `destroy`). Run `-Action gpus` first to confirm the exact `--gpu` identifier string for the RTX PRO 6000 (docs name it "RTX PRO 6000 Blackwell" / "RTX 6000 Pro" but don't publish the flag value); the script defaults to `RTX6000PRO` as a placeholder.
@@ -58,3 +58,9 @@ Status: completed on 2026-07-14 UTC for the single-GPU compile-fix shakedown. Th
 - Follow-up 4-GPU progress check: `step 10 | loss 9.6714 | 6352ms/step`.
 - Final 4-GPU outcome: `=== final val loss 8.6390 ===` and `saved checkpoint -> /home/runs/h200_shakedown/model.pt`, with `config.json`, `model.pt`, and `result.json` present in `/home/runs/h200_shakedown`.
 - Cost implication from the measured 4-GPU H200 run: at `6.35s/step` and `$15.96/hr`, the raw rental burn is about `567 steps/hr` and roughly `$0.028/step` before checkpoint/upload overhead. Seq-len choice remains a [HUMAN GATE] decision and is intentionally not committed here.
+- Final proof summary:
+  - Single GPU `RTX-PRO6000`: loss `12.01 -> 8.64`, about `40s/step`, proven.
+  - Multi GPU `4x H200`: loss `12.00 -> 8.64`, about `6.35s/step`, proven.
+  - Jarvis credit used: about `$6.10` (`$500 -> $493.90`).
+  - Vast credit used earlier during the original failed shakedowns: about `$29` (`$373 -> $345`).
+  - The `--no_compile` fix resolves the old pre-step hang in both single-GPU and multi-GPU validation.
