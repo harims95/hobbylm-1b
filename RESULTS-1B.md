@@ -33,3 +33,28 @@ Status: compile-hang fix is committed on `fix/vast-compile-hang` (`d4874cb`) but
 - Note: the FP8 head path is unused for the intended run (`fused_ce` is used) and was already flagged as broken in review, but its nested compile decorators were still reachable.
 - Lesson: kill any hung shakedown within 5 minutes. If power is around 120W and no loss appears, treat it as hung; do not wait 20-30 minutes.
 - Next validation: run one cheap single-GPU rental with `--no_compile`. Passing signal is first loss near 10.83 and real training power around 600W. Merge only after that succeeds.
+
+## Jarvis Labs Path
+
+Status: completed on 2026-07-14 UTC for the single-GPU compile-fix shakedown. The run trained through step 20, wrote a checkpoint, and exited cleanly, so the old pre-step-0 compile hang did not reproduce. Jarvis account shows `$500` grants available.
+
+- Auth: `jl` CLI reads `JL_API_KEY` from the environment (CLI arg > `JL_API_KEY` > `~/.config/jl/config.toml`). Same pattern as Vast's `VAST_API_KEY` — key lives in `.env`/shell env, never in repo files.
+- `scripts/jarvis_instance.ps1`: mirrors `vast_instance.ps1` but wraps the `jl` CLI (`gpus`, `create`, `list`, `get`, `ssh`, `pause`, `resume`, `destroy`). Run `-Action gpus` first to confirm the exact `--gpu` identifier string for the RTX PRO 6000 (docs name it "RTX PRO 6000 Blackwell" / "RTX 6000 Pro" but don't publish the flag value); the script defaults to `RTX6000PRO` as a placeholder.
+- `scripts/launch_jarvis_train.py`: mirrors `launch_vast_train.py` with two changes — default paths under `/home` instead of `/workspace` (Jarvis only persists `/home` across pause/resume; everything else is wiped), and a `--no-compile` passthrough flag (needed for the shakedown test below; the Vast script didn't expose one).
+- Everything else transfers unchanged: `training/train.py`, the data loader, the `HOBBYLM_NO_COMPILE` compile fix in `hobbylm/model.py`, `stage_vast_data.py` (HF source is public, just pass `--out /home/data/mix100B --val-out /home/data/fineweb_val`), the `torchrun --standalone` invocation shape, and `backup_vast_checkpoints.py` (pass `--run-dir /home/runs/<run_name>`).
+- Shakedown test command (single GPU, 20 steps, eager): see `scripts/launch_jarvis_train.py --nproc-per-node 1 --run-name jarvis_shakedown_test --max-steps 20 --schedule-max-steps 20 --save-every 0 --val-every 20 --no-compile`. Same pass signal as the Vast test: first loss near 10.83, power around 600W, no pre-step-0 hang.
+- Jarvis GPU identifier confirmed from `jl gpus`: `RTX-PRO6000` in `IN1`.
+- Live shakedown instance: 1x `RTX-PRO6000`, PyTorch template, 50 GB storage, region `IN1`.
+- Public branch used for the live test: `https://github.com/harims95/hobbylm-1b.git` on `fix/vast-compile-hang` (that branch name was not published on the `harims95/HobbyLM` remote).
+- Staged tiny smoke-test slice under `/home`: `edu_fineweb_train_000001.bin`, `dclm_000001.bin`, `code_000001.bin`, `math_000001.bin`, plus `fineweb_val_000000.bin`.
+- Direct live command used on the Jarvis box: `torchrun --standalone --nproc_per_node=1 training/train.py --preset 1B --run_name jarvis_shakedown_test --data_dir /home/data/mix100B --out_dir /home/runs --max_steps 20 --schedule_max_steps 20 --micro_batch_seqs 4 --seq_len 2048 --batch_tokens 1048576 --train_pattern edu_fineweb_train_000001.bin,dclm_000001.bin,code_000001.bin,math_000001.bin --val_pattern /home/data/fineweb_val/fineweb_val_000000.bin --orthogonalizer ns5 --save_every 0 --val_every 20 --stratified_shards --set fused_ce=true --no_compile`.
+- First confirmed training signal from the live Jarvis log: `step 0 | loss 12.0116 | 41025ms/step`.
+- Follow-up progress check while still running: `step 10 | loss 9.6858 | 40118ms/step`.
+- Live health check at `2026-07-14T18:48:37Z`: GPU power `388.37W`, util `98%`, memory `51062 MB`. This is slow single-GPU training with `accum=128`, not the old ~120W no-loss hang.
+- Final training outcome from the live Jarvis log: `>> val loss 8.6446 @ step 20`, `=== final val loss 8.6446 ===`, and `saved checkpoint -> /home/runs/jarvis_shakedown_test/model.pt`.
+- Final completion check at `2026-07-14T19:00:12Z`: no `torchrun` / `training/train.py` processes remained, GPU power was back to idle at `85.79W`, and the run directory contained `config.json`, `model.pt`, and `result.json`.
+- Multi-GPU follow-up gate passed on Jarvis `4x H200` in `IN2` (instance `446419`, resumed as `446421`): `torchrun --standalone --nproc_per_node=4 training/train.py --preset 1B --no_compile ... --stratified_shards --set fused_ce=true` trained cleanly on 4 GPUs with the staged public `/home` shard slice.
+- First confirmed 4-GPU training signal: `step 0 | loss 12.0016 | 8700ms/step` with all four H200s at high power (`562.08W`, `572.65W`, `561.18W`, `579.75W`) and about `50.3 GB` memory per GPU, proving the old compile hang is gone in multi-GPU too.
+- Follow-up 4-GPU progress check: `step 10 | loss 9.6714 | 6352ms/step`.
+- Final 4-GPU outcome: `=== final val loss 8.6390 ===` and `saved checkpoint -> /home/runs/h200_shakedown/model.pt`, with `config.json`, `model.pt`, and `result.json` present in `/home/runs/h200_shakedown`.
+- Cost implication from the measured 4-GPU H200 run: at `6.35s/step` and `$15.96/hr`, the raw rental burn is about `567 steps/hr` and roughly `$0.028/step` before checkpoint/upload overhead. Seq-len choice remains a [HUMAN GATE] decision and is intentionally not committed here.
