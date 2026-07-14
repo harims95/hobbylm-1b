@@ -6,7 +6,6 @@ Loss = cross-entropy + final-logit z-loss + sum of per-layer MoE aux/z losses.
 from __future__ import annotations
 
 import math
-import os
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -15,14 +14,6 @@ from torch import Tensor
 
 from .config import ModelConfig
 from .moe import MoE, SwiGLUWeights
-
-
-def _maybe_compile(fn):
-    """Allow --no_compile to disable nested custom-op compiles during shakedowns."""
-    if os.environ.get("HOBBYLM_NO_COMPILE") == "1":
-        return fn
-    return torch.compile(fn)
-
 
 # -----------------------------------------------------------------------------
 # FP8 matmul for the lm_head (the single largest GEMM). Adapted from modded-nanogpt
@@ -34,7 +25,6 @@ def _maybe_compile(fn):
 @torch.library.custom_op("moelab::mm_t", mutates_args=())
 def _mm_t(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     """y = x @ w with x:(M,in), w:(in,out). Returns (y_bf16, x_f8, w_f8) for backward reuse."""
-    @_maybe_compile
     def impl(x: Tensor, w: Tensor):
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
@@ -54,7 +44,6 @@ def _(x: Tensor, w: Tensor, *_):
 
 @torch.library.custom_op("moelab::mm_t_backward", mutates_args=())
 def _mm_t_backward(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @_maybe_compile
     def impl(g: Tensor, x_f8: Tensor, w_f8: Tensor):
         x_scale = g.new_tensor(x_s, dtype=torch.float32)
         w_scale = g.new_tensor(w_s, dtype=torch.float32)

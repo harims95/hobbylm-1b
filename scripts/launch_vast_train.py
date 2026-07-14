@@ -66,7 +66,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Launch HobbyLM training on a Vast box with torchrun.")
-    ap.add_argument("--nproc-per-node", type=int, default=4)
+    ap.add_argument("--nproc-per-node", type=int, default=8,
+                    help="Flagship default: one 8xH100 SXM host.")
     ap.add_argument("--preset", default="1B")
     ap.add_argument("--run-name", default="1b_main_vast")
     ap.add_argument("--data-dir", default="/workspace/data/mix100B")
@@ -78,8 +79,9 @@ def main() -> None:
                     help="Main-phase stop step for 85B tokens at 1,048,576 tokens/step.")
     ap.add_argument("--schedule-max-steps", type=int, default=95_367,
                     help="Full 100B-token schedule horizon at 1,048,576 tokens/step.")
-    ap.add_argument("--micro-batch-seqs", type=int, default=4)
-    ap.add_argument("--seq-len", type=int, default=2048)
+    ap.add_argument("--micro-batch-seqs", type=int, default=32,
+                    help="Validated seq_len=1024 throughput setting; reduce only if the host OOMs.")
+    ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--batch-tokens", type=int, default=1_048_576)
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--val-every", type=int, default=250)

@@ -81,14 +81,15 @@ def main() -> None:
                     help="Main-phase stop step for 85B tokens at 1,048,576 tokens/step.")
     ap.add_argument("--schedule-max-steps", type=int, default=95_367,
                     help="Full 100B-token schedule horizon at 1,048,576 tokens/step.")
-    ap.add_argument("--micro-batch-seqs", type=int, default=4)
-    ap.add_argument("--seq-len", type=int, default=2048)
+    ap.add_argument("--micro-batch-seqs", type=int, default=32,
+                    help="Validated seq_len=1024 throughput setting; reduce only if the host OOMs.")
+    ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--batch-tokens", type=int, default=1_048_576)
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--val-every", type=int, default=250)
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"])
     ap.add_argument("--no-compile", action="store_true",
-                    help="run fully eager (top-level + nested custom-op compiles); see RESULTS-1B.md compile-hang note.")
+                    help="run fully eager by skipping whole-model torch.compile.")
     ap.add_argument("--resume", default="")
     ap.add_argument("--init-from", default="")
     ap.add_argument("--set", nargs="*", default=[], help="Additional ModelConfig overrides key=value.")

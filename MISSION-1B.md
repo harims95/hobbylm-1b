@@ -14,7 +14,7 @@ to every step here, especially "neural-net code fails silently."
 ## 1. GOAL
 
 Train the strongest ~1B-total-parameter sparse-MoE model we can on 100B tokens of our
-curated mix, for roughly $600–900 cash (after brother's Vast credits), building on the
+curated mix, for roughly $500–750 cash (after brother's Vast credits), building on the
 HobbyLM codebase and everything proven in the 130M runs.
 
 **Definition of success:**
@@ -54,7 +54,7 @@ a phase.
 | # | Decision | Why |
 |---|----------|-----|
 | D1 | Architecture = brother's 1B preset, unchanged except D2/D3 | Ablation-settled; our edge is data, not architecture |
-| D2 | seq_len 2048 (up from 1024) | 1024 caps evals and real usability; 2048 safe at RoPE θ=10k |
+| D2 | **seq_len 1024** | Matches the validated 130M recipe, Harish's prior runs, and the measured 1B throughput baseline. Explore 2048 only as a v2 after the base model ships. |
 | D3 | Consider top_k 8→12 ONLY if the Phase 2 ablation says so | 1B preset is ~7× sparse (~140M active); evals compare vs dense 360–600M. Prior ablation favored more active experts. Gated on evidence, not vibes |
 | D4 | **Tokenizer = GPT-2 (vocab 50,304), NOT SmolLM2** | Phase 0.3 measured only 4.19% fewer tokens with SmolLM2 on a ~200MB mix sample, below the 5% threshold. Keep 130M comparability and avoid vocab/eval/Rust/GGUF churn. IDs still fit uint16 |
 | D5 | Data = 100B curated mix: 60% FineWeb-Edu from Karpathy's byte-verified GPT-2 shards, 15% DCLM, 10% code (Stack-Edu, multi-language), 10% FineMath, 5% anneal | 10× scale of the validated 5B mix; only the non-edu 40B must be built on Modal; code source upgraded to Stack-Edu (see §5a) |
@@ -62,7 +62,7 @@ a phase.
 | D7 | Two-phase training: main 85% + anneal 15% | Validated at 130M |
 | D8 | Data build + backup + evals + SFT on **Modal**; **flagship training on Vast** | Modal convenient/cheap for small jobs; Vast ~35% cheaper for the one big job + brother's $370 credit |
 | D9 | Every shard uploaded to a HF dataset repo as it's built | Backup + data-transfer bridge to Vast + reproducibility |
-| D10 | A cheap 130M shakedown run ON VAST before the flagship | De-risk the SSH/torchrun/resume path before betting $600 on it |
+| D10 | A cheap 130M shakedown run ON VAST before the flagship | De-risk the SSH/torchrun/resume path before committing to the ~$550–800 flagship rental |
 | D11 | Always `--opts fused_ce`; never fp8 | Measured |
 | D12 | Judge on lm-eval avg; val loss is sanity-only | Val loss still depends on data/order, but GPT-2 keeps tokenizer comparability with the 130M runs |
 
@@ -73,7 +73,7 @@ a phase.
 1. Confirm the 130M validation is accepted as passed (data recipe green-lit). If not, stop.
 2. `[HUMAN GATE]` Confirm budgets & accounts:
    - Modal: your account (data build, evals, SFT) — est. ~$120 needed.
-   - Vast: brother's account, ~$370 credit + ability to add ~$250 cash if needed.
+   - Vast: brother's account, ~$370 credit + ability to cover the post-credit remainder after the final host quote.
    - HF: token with write access (for the shard backup repo).
 3. **Tokenizer compression sanity check complete:** GPT-2 vs SmolLM2 on the same ~200MB
    sample measured only a 4.19% SmolLM2 token-count reduction, below the 5% threshold.
@@ -153,7 +153,7 @@ Skip entirely if budget is tight — it's optimization, not a requirement.
 
 ## 7. PHASE 3 — VAST SHAKEDOWN (Vast, ~$5, MANDATORY before flagship) [HUMAN GATE to spend]
 
-Prove the Vast execution path cheaply before the $600 job rides on it.
+Prove the Vast execution path cheaply before the ~$550–800 job rides on it.
 
 1. **Pick a host** (verified datacenter, on-demand, reliability ≥99.5%, max-duration ≥1
    month, 8×H100 SXM on ONE machine, disk ≥500GB NVMe). Never interruptible for the
@@ -166,21 +166,22 @@ Prove the Vast execution path cheaply before the $600 job rides on it.
    `torchrun --nproc_per_node=8 training/train.py --preset 130M --max-steps 200 ...`
    with checkpoints every 50 steps to a persistent location (Vast volume or push to HF).
 5. **Shakedown gates:** first loss ≈ ln(50304) ≈ 10.8; loss falls; checkpoint saves AND
-   resumes after a deliberate kill; step time sane. At seq_len 2048, `micro_batch_seqs=4`
-   on 4×H100 is an OOM unknown until measured; if it OOMs, tune micro-batch down on the
-   shakedown before any flagship launch. If all pass, the Vast path is trusted.
+   resumes after a deliberate kill; step time sane. At the locked seq_len 1024, begin from
+   the validated `micro_batch_seqs=32` throughput configuration and tune it only if the rented
+   host differs materially. If all pass, the Vast path is trusted.
    If not, fix on the cheap run — never debug on the flagship.
 6. Destroy the shakedown instance (stop paying).
 
 ---
 
-## 8. PHASE 4 — THE FLAGSHIP (Vast, ~$600–850, ~45h on 8×H100 SXM) [HUMAN GATE before launch]
+## 8. PHASE 4 — THE FLAGSHIP (Vast, ~$550–800, ~41–42h on 8×H100 SXM) [HUMAN GATE before launch]
 
-1. **Recompute the run:** 100B tokens ÷ (batch tokens/step) = total steps; main = 85%,
-   anneal = 15%; `schedule_max_steps` = total. At seq 2048, re-probe throughput with a
-   short speed test on the rented host BEFORE committing — do not trust the 1024 numbers.
-   Adjust micro-batch down if OOM (fused_ce headroom helps).
-2. `[HUMAN GATE]` Present measured ms/step @2048, projected wall-clock, projected cost
+1. **Locked run math:** seq_len 1024, 1,048,576 batch tokens/step, 95,367 total steps;
+   main = 81,062 steps (85B tokens), anneal = 14,305 steps (15B tokens), and
+   `schedule_max_steps=95,367`. The validated 8×H100 measurement is ~1.53s/step, which
+   projects ~40.5 compute hours; budget 41–42h including normal validation/checkpoint overhead.
+   Re-probe briefly on the rented host before committing because host implementations vary.
+2. `[HUMAN GATE]` Present measured ms/step @1024, projected wall-clock, projected cost
    (cash + credit split), and confirm the host meets all Phase 3 criteria. Get explicit go.
 3. **Rent the flagship host** (same criteria as Phase 3; verified/on-demand). Download the
    full 200GB shard set from HF backup to the box. Verify shard count + a decode sample.
@@ -253,11 +254,11 @@ Prove the Vast execution path cheaply before the $600 job rides on it.
 | 1 | 100B data build + HF backup (Modal CPU) | ~$10 + storage |
 | 2 | Optional top_k ablation (Modal) | ~$40 |
 | 3 | Vast shakedown (130M, ~$5) | ~$5 |
-| 4 | Flagship (Vast, ~45h, 8×H100 SXM single host; ~360 GPU-hours) | ~$600–850 |
+| 4 | Flagship (Vast, ~41–42h, 8×H100 SXM single host; ~328–336 GPU-hours) | ~$550–800 |
 | 5 | Evals + GGUF (Modal) | ~$30 |
 | 5 | Post-train SFT+DPO (Modal, optional) | ~$100 |
 | — | HF storage (200GB, few months) | ~$0–20 |
 | — | Buffer (~10%) | ~$100 |
-| **Total** | | **~$900–1,150 gross; ~$530–780 cash after brother's $370 Vast credit** |
+| **Total** | | **~$850–1,100 gross; ~$480–730 cash after brother's $370 Vast credit** |
 
 Hard cap without new human approval: **$1,200 gross.**
