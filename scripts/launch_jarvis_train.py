@@ -54,6 +54,12 @@ def build_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.no_compile:
         cmd.append("--no_compile")
+    if args.wandb:
+        cmd += [
+            "--wandb",
+            "--wandb_project", args.wandb_project,
+            "--wandb_entity", args.wandb_entity,
+        ]
     resume = args.resume
     if resume == "latest":
         resume = latest_checkpoint(f"{args.out_dir.rstrip('/')}/{args.run_name}")
@@ -90,6 +96,10 @@ def main() -> None:
     ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"])
     ap.add_argument("--no-compile", action="store_true",
                     help="run fully eager by skipping whole-model torch.compile.")
+    ap.add_argument("--wandb", action="store_true",
+                    help="enable Weights & Biases logging for the launched training run.")
+    ap.add_argument("--wandb-project", default="hobbylm-1b")
+    ap.add_argument("--wandb-entity", default="hariharanms95-fuellabs")
     ap.add_argument("--resume", default="")
     ap.add_argument("--init-from", default="")
     ap.add_argument("--set", nargs="*", default=[], help="Additional ModelConfig overrides key=value.")

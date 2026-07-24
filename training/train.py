@@ -102,6 +102,12 @@ def main():
     ap.add_argument("--init_from", default="", help="checkpoint .pt to resume model weights from (continued pretrain)")
     ap.add_argument("--resume", default="", help="checkpoint .pt to resume full training state from")
     ap.add_argument("--lr_mult", type=float, default=1.0, help="multiply base LRs (use <1 for finetune/ctx-extension)")
+    ap.add_argument("--wandb", action="store_true",
+                    help="enable Weights & Biases logging (requires WANDB_API_KEY in env)")
+    ap.add_argument("--wandb_project", default="hobbylm-1b",
+                    help="Weights & Biases project name when --wandb is enabled")
+    ap.add_argument("--wandb_entity", default="hariharanms95-fuellabs",
+                    help="Weights & Biases entity when --wandb is enabled")
     ap.add_argument("--set", nargs="*", default=[], help="model config overrides key=value")
     args = ap.parse_args()
     if args.init_from and args.resume:
@@ -202,25 +208,51 @@ def main():
     log(f"train_pattern={train_pattern} val_pattern={val_pattern}")
     log(f"schedule_max_steps={schedule_max_steps}")
 
+    run_config = {
+        **cfg.to_dict(),
+        "preset": args.preset,
+        "train": {
+            "data_dir": tc.data_dir,
+            "train_pattern": tc.train_pattern,
+            "val_pattern": tc.val_pattern,
+            "max_steps": tc.max_steps,
+            "schedule_max_steps": schedule_max_steps,
+            "batch_tokens": tc.batch_tokens,
+            "micro_batch_seqs": tc.micro_batch_seqs,
+            "shuffle_shards": args.shuffle_shards,
+            "stratified_shards": args.stratified_shards,
+            "seed": tc.seed,
+            "seq_len": tc.seq_len,
+            "val_every": tc.val_every,
+            "out_dir": tc.out_dir,
+            "compile": tc.compile,
+            "orthogonalizer": tc.orthogonalizer,
+            "lr_mult": args.lr_mult,
+            "wandb": args.wandb,
+            "wandb_project": args.wandb_project,
+            "wandb_entity": args.wandb_entity,
+        },
+    }
+
     out_dir = Path(tc.out_dir) / tc.run_name
     if master:
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "config.json").write_text(json.dumps({
-            **cfg.to_dict(),
-            "preset": args.preset,
-            "train": {
-                "data_dir": tc.data_dir,
-                "train_pattern": tc.train_pattern,
-                "val_pattern": tc.val_pattern,
-                "max_steps": tc.max_steps,
-                "schedule_max_steps": schedule_max_steps,
-                "batch_tokens": tc.batch_tokens,
-                "micro_batch_seqs": tc.micro_batch_seqs,
-                "shuffle_shards": args.shuffle_shards,
-                "stratified_shards": args.stratified_shards,
-                "seed": tc.seed,
-            },
-        }, indent=2))
+        (out_dir / "config.json").write_text(json.dumps(run_config, indent=2))
+
+    wandb_run = None
+    if args.wandb and master:
+        if not os.environ.get("WANDB_API_KEY"):
+            raise SystemExit("WANDB_API_KEY must be set in the environment when using --wandb")
+        try:
+            import wandb
+        except ImportError as exc:
+            raise SystemExit("wandb is not installed; install dependencies or omit --wandb") from exc
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.run_name,
+            config=run_config,
+        )
 
     def save_ckpt(fname, **extra):
         if not master:
@@ -229,18 +261,7 @@ def main():
                     "muon": muon.state_dict(),
                     "adamw": adamw.state_dict(),
                     "config": {**cfg.to_dict(), "preset": args.preset},
-                    "train": {
-                        "data_dir": tc.data_dir,
-                        "train_pattern": tc.train_pattern,
-                        "val_pattern": tc.val_pattern,
-                        "max_steps": tc.max_steps,
-                        "schedule_max_steps": schedule_max_steps,
-                        "batch_tokens": tc.batch_tokens,
-                        "micro_batch_seqs": tc.micro_batch_seqs,
-                        "shuffle_shards": args.shuffle_shards,
-                        "stratified_shards": args.stratified_shards,
-                        "seed": tc.seed,
-                    },
+                    "train": run_config["train"],
                     **extra}, out_dir / fname)
         log(f"saved checkpoint -> {out_dir / fname}")
 
@@ -310,17 +331,29 @@ def main():
         if step % tc.log_every == 0:
             dt = (time.time() - t0) / (step - start_step + 1)
             log(f"step {step:5d} | loss {loss_accum.item():.4f} | lr {tc.muon_lr*m:.4f} | {dt*1000:.0f}ms/step")
+            if wandb_run is not None:
+                wandb_run.log({
+                    "train/loss": loss_accum.item(),
+                    "lr": tc.muon_lr * m,
+                    "step_time_ms": dt * 1000,
+                }, step=step)
         if tc.val_every and (step + 1) % tc.val_every == 0:
             vl = evaluate()
             log(f"  >> val loss {vl:.4f} @ step {step+1}")
+            if wandb_run is not None:
+                wandb_run.log({"val/loss": vl}, step=step + 1)
         if args.save_every and (step + 1) % args.save_every == 0:
             save_ckpt(f"ckpt_{step+1}.pt", step=step + 1)
 
     vl = evaluate()
     log(f"=== final val loss {vl:.4f} ===")
+    if wandb_run is not None:
+        wandb_run.log({"val/loss": vl}, step=tc.max_steps)
     if master:
         (out_dir / "result.json").write_text(json.dumps({"final_val_loss": vl, "steps": tc.max_steps}))
     save_ckpt("model.pt", step=tc.max_steps, val_loss=vl)
+    if wandb_run is not None:
+        wandb_run.finish()
     if ddp:
         dist.destroy_process_group()
 
